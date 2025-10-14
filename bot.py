@@ -16,8 +16,8 @@ LEADERBOARD_LIMIT_DEFAULT = int(os.getenv("LEADERBOARD_LIMIT_DEFAULT", "10"))
 # 🍉 Currency symbol
 CURRENCY = "🍉"
 
-# 🔒 Target user restrictions
-TARGET_USER_ID = 1028310674318839878  # Only this user can gain/lose smuckles
+# 🔒 Only this user can gain/lose smuckles; they cannot execute give/take
+TARGET_USER_ID = 1028310674318839878
 
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
@@ -91,7 +91,6 @@ def has_mod_role(member: discord.Member) -> bool:
 
 # ========= COOLDOWN =========
 last_give_ts: dict[int, float] = {}
-
 def on_cooldown(user_id: int) -> bool:
     now = asyncio.get_event_loop().time()
     last = last_give_ts.get(user_id, 0)
@@ -100,20 +99,20 @@ def on_cooldown(user_id: int) -> bool:
     last_give_ts[user_id] = now
     return False
 
-# ========= READY EVENT =========
+# ========= READY =========
 @bot.event
 async def on_ready():
     await db_init()
     await bot.tree.sync()
     print(f"✅ Bot connected and synced as {bot.user}")
 
-# ========= TEST COMMAND =========
-@bot.tree.command(name="ping", description="Check if the bot is online and responsive")
-async def ping(interaction: discord.Interaction):
-    latency = round(bot.latency * 1000)  # ms
-    await interaction.response.send_message(f"🏓 Pong! Latency: {latency}ms")
+# ========= UNIQUE PING =========
+@bot.tree.command(name="papoping", description="Check if Papo is online and running")
+async def papoping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🍉 Papo is online! Latency: {latency}ms")
 
-# ========= GIVE COMMAND =========
+# ========= GIVE =========
 @bot.tree.command(description="Give smuckles to the designated member")
 @app_commands.describe(member="Must be the designated member", amount="How many (positive integer)", reason="Optional reason")
 async def give(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
@@ -139,7 +138,7 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     text += f". New total: **{total} {CURRENCY}**."
     await interaction.response.send_message(text)
 
-# ========= TAKE COMMAND =========
+# ========= TAKE =========
 @bot.tree.command(description="Take smuckles from the designated member")
 @app_commands.describe(member="Must be the designated member", amount="How many (positive integer)", reason="Optional reason")
 async def take(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
@@ -165,7 +164,7 @@ async def take(interaction: discord.Interaction, member: discord.Member, amount:
     text += f". New total: **{total} {CURRENCY}**."
     await interaction.response.send_message(text)
 
-# ========= SMUCKLES COMMAND =========
+# ========= SMUCKLES =========
 @bot.tree.command(name="smuckles", description="Check your (or another member’s) smuckles")
 @app_commands.describe(member="Whose balance to check (optional)")
 async def smuckles(interaction: discord.Interaction, member: discord.Member | None = None):
