@@ -8,17 +8,16 @@ from discord.ext import commands
 # ========= CONFIG =========
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
-# Comma-separated role IDs allowed to run /take (leave empty to allow everyone)
 MOD_ROLE_IDS = [int(x) for x in os.getenv("MOD_ROLE_IDS", "").split(",") if x.strip().isdigit()]
 GIVE_COOLDOWN_SECONDS = int(os.getenv("GIVE_COOLDOWN_SECONDS", "8"))
 MAX_DELTA_PER_TXN = int(os.getenv("MAX_DELTA_PER_TXN", "250"))
 LEADERBOARD_LIMIT_DEFAULT = int(os.getenv("LEADERBOARD_LIMIT_DEFAULT", "10"))
 
-# 🍉 Currency symbol for Smuckles
+# 🍉 Currency symbol
 CURRENCY = "🍉"
 
-# 🔒 Only this member can receive/lose smuckles; they cannot execute give/take
-TARGET_USER_ID = 1028310674318839878
+# 🔒 Target user restrictions
+TARGET_USER_ID = 1028310674318839878  # Only this user can gain/lose smuckles
 
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
@@ -26,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
 
-# ========= DB =========
+# ========= DATABASE =========
 CREATE_USERS = """
 CREATE TABLE IF NOT EXISTS smuckles_users (
   guild_id BIGINT NOT NULL,
@@ -51,7 +50,7 @@ CREATE TABLE IF NOT EXISTS smuckles_log (
 async def db_init():
     global db_pool
     if not DATABASE_URL:
-        raise SystemExit("Missing DATABASE_URL env var.")
+        raise SystemExit("❌ Missing DATABASE_URL environment variable.")
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
     async with db_pool.acquire() as con:
         await con.execute(CREATE_USERS)
@@ -69,12 +68,6 @@ async def adjust_points(guild_id: int, target_id: int, delta: int):
                 delta, guild_id, target_id,
             )
 
-def has_mod_role(member: discord.Member) -> bool:
-    if not MOD_ROLE_IDS:
-        return True  # everyone allowed
-    member_role_ids = {r.id for r in getattr(member, "roles", [])}
-    return any(rid in member_role_ids for rid in MOD_ROLE_IDS)
-
 async def get_points(guild_id: int, user_id: int) -> int:
     async with db_pool.acquire() as con:
         row = await con.fetchrow(
@@ -90,6 +83,12 @@ async def log_txn(guild_id: int, actor_id: int, target_id: int, delta: int, reas
             guild_id, actor_id, target_id, delta, reason,
         )
 
+def has_mod_role(member: discord.Member) -> bool:
+    if not MOD_ROLE_IDS:
+        return True  # everyone allowed if not set
+    member_role_ids = {r.id for r in getattr(member, "roles", [])}
+    return any(rid in member_role_ids for rid in MOD_ROLE_IDS)
+
 # ========= COOLDOWN =========
 last_give_ts: dict[int, float] = {}
 
@@ -101,24 +100,26 @@ def on_cooldown(user_id: int) -> bool:
     last_give_ts[user_id] = now
     return False
 
-# ========= READY =========
+# ========= READY EVENT =========
 @bot.event
 async def on_ready():
     await db_init()
     await bot.tree.sync()
-    print(f"Synced slash commands as {bot.user}")
+    print(f"✅ Bot connected and synced as {bot.user}")
 
-# ========= COMMANDS =========
+# ========= TEST COMMAND =========
+@bot.tree.command(name="ping", description="Check if the bot is online and responsive")
+async def ping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)  # ms
+    await interaction.response.send_message(f"🏓 Pong! Latency: {latency}ms")
+
+# ========= GIVE COMMAND =========
 @bot.tree.command(description="Give smuckles to the designated member")
 @app_commands.describe(member="Must be the designated member", amount="How many (positive integer)", reason="Optional reason")
 async def give(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
-    # The target must be the designated member
     if member.id != TARGET_USER_ID:
         return await interaction.response.send_message(
-            f"Only <@{TARGET_USER_ID}> can receive {CURRENCY} smuckles.",
-            ephemeral=True
-        )
-    # The designated member cannot execute give/take
+            f"Only <@{TARGET_USER_ID}> can receive {CURRENCY} smuckles.", ephemeral=True)
     if interaction.user.id == TARGET_USER_ID:
         return await interaction.response.send_message("You cannot modify smuckles.", ephemeral=True)
     if amount <= 0:
@@ -138,19 +139,15 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     text += f". New total: **{total} {CURRENCY}**."
     await interaction.response.send_message(text)
 
+# ========= TAKE COMMAND =========
 @bot.tree.command(description="Take smuckles from the designated member")
 @app_commands.describe(member="Must be the designated member", amount="How many (positive integer)", reason="Optional reason")
 async def take(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
-    # Only mods (if MOD_ROLE_IDS set)
     if not has_mod_role(interaction.user):
         return await interaction.response.send_message("Only moderators can use /take.", ephemeral=True)
-    # Target restriction
     if member.id != TARGET_USER_ID:
         return await interaction.response.send_message(
-            f"Only <@{TARGET_USER_ID}> can have {CURRENCY} smuckles taken away.",
-            ephemeral=True
-        )
-    # The designated member cannot execute give/take
+            f"Only <@{TARGET_USER_ID}> can have {CURRENCY} smuckles taken away.", ephemeral=True)
     if interaction.user.id == TARGET_USER_ID:
         return await interaction.response.send_message("You cannot modify smuckles.", ephemeral=True)
     if amount <= 0:
@@ -168,6 +165,7 @@ async def take(interaction: discord.Interaction, member: discord.Member, amount:
     text += f". New total: **{total} {CURRENCY}**."
     await interaction.response.send_message(text)
 
+# ========= SMUCKLES COMMAND =========
 @bot.tree.command(name="smuckles", description="Check your (or another member’s) smuckles")
 @app_commands.describe(member="Whose balance to check (optional)")
 async def smuckles(interaction: discord.Interaction, member: discord.Member | None = None):
@@ -175,6 +173,7 @@ async def smuckles(interaction: discord.Interaction, member: discord.Member | No
     total = await get_points(interaction.guild_id, target.id)
     await interaction.response.send_message(f"🎯 {target.mention} has **{total} {CURRENCY}** smuckles.")
 
+# ========= LEADERBOARD =========
 @bot.tree.command(description="Top members by smuckles")
 @app_commands.describe(limit="How many to show (default 10, max 30)")
 async def leaderboard(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMIT_DEFAULT):
@@ -199,8 +198,7 @@ async def leaderboard(interaction: discord.Interaction, limit: int = LEADERBOARD
 
     await interaction.response.send_message("🏆 **Smuckles Leaderboard**\n" + "\n".join(lines))
 
-# ---- run ----
+# ========= RUN =========
 if not TOKEN:
-    raise SystemExit("Missing DISCORD_TOKEN env var.")
-
+    raise SystemExit("❌ Missing DISCORD_TOKEN environment variable.")
 bot.run(TOKEN)
