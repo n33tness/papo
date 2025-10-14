@@ -8,23 +8,29 @@ from discord.ext import commands
 # ========= CONFIG =========
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-guild sync
 
 # 🍉 Currency symbol
 CURRENCY = "🍉"
 
-# 🔒 IDs
+# 🔒 IDs (edit if they change)
 TARGET_USER_ID = 1028310674318839878         # only this user can gain/lose smuckles
-AUTHORIZED_GIVER_ID = 1422010902680567918    # only this user can give/take
-ADMIN_USER_ID = 939225086341296209           # admin override
+AUTHORIZED_GIVER_ID = 1422010902680567918    # primary authorized user for /give and /take
+ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, and bonk)
 
-# Settings
-VALID_AMOUNTS = [5, 10, 50]
+# Smuckles settings
+VALID_AMOUNTS = (5, 10, 50)                  # allowed increments; 50 is jackpot
 LEADERBOARD_LIMIT_DEFAULT = 10
 GIVE_COOLDOWN_SECONDS = 8
 
+# Bonk settings
+BONK_EMOJI = "<:bonk:1427717741481033799>"
+BONK_COOLDOWN_SECONDS = 3
+
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
+# Needed for the bonk trigger (reading message content)
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
@@ -103,6 +109,15 @@ def on_cooldown(user_id: int) -> bool:
     last_give_ts[user_id] = now
     return False
 
+last_bonk_ts: dict[int, float] = {}
+def bonk_on_cooldown(user_id: int) -> bool:
+    now = asyncio.get_event_loop().time()
+    last = last_bonk_ts.get(user_id, 0)
+    if now - last < BONK_COOLDOWN_SECONDS:
+        return True
+    last_bonk_ts[user_id] = now
+    return False
+
 # ========= READY =========
 @bot.event
 async def on_ready():
@@ -110,10 +125,10 @@ async def on_ready():
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
+        await bot.tree.sync(guild=guild)   # instant registration in your server
         print(f"✅ Synced guild commands to {GUILD_ID} as {bot.user}")
     else:
-        await bot.tree.sync()
+        await bot.tree.sync()              # global (can be slower to appear)
         print(f"✅ Synced global commands as {bot.user}")
 
 # ========= /papoping =========
@@ -123,7 +138,7 @@ async def papoping(interaction: discord.Interaction):
     await interaction.response.send_message(f"🍉 Papo is online! Ping: `{latency}ms`")
 
 # ========= /give =========
-@bot.tree.command(description="Give smuckles to the designated member")
+@bot.tree.command(description="Give smuckles to the designated member (5, 10, or 50)")
 @app_commands.describe(member="Must be the designated member", amount="5, 10, or 50", reason="Optional reason")
 async def give(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
     if not is_authorized_actor(interaction.user.id):
@@ -148,7 +163,7 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     await interaction.response.send_message(text)
 
 # ========= /take =========
-@bot.tree.command(description="Take smuckles from the designated member")
+@bot.tree.command(description="Take smuckles from the designated member (5, 10, or 50)")
 @app_commands.describe(member="Must be the designated member", amount="5, 10, or 50", reason="Optional reason")
 async def take(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
     if not is_authorized_actor(interaction.user.id):
@@ -167,7 +182,7 @@ async def take(interaction: discord.Interaction, member: discord.Member, amount:
         text += f" (_{reason}_)"
     await interaction.response.send_message(text)
 
-# ========= /sandia =========
+# ========= /sandia (leaderboard) =========
 @bot.tree.command(name="sandia", description="Top members by smuckles (🍉 leaderboard)")
 @app_commands.describe(limit="How many to show (default 10, max 30)")
 async def sandia(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMIT_DEFAULT):
@@ -191,6 +206,26 @@ async def sandia(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMI
         lines.append(f"{i}. **{name}** — {pts} {CURRENCY}")
 
     await interaction.response.send_message("🏆 **Sandia Leaderboard**\n" + "\n".join(lines))
+
+# ========= BONK EMOTE TRIGGER =========
+@bot.event
+async def on_message(message: discord.Message):
+    # ignore bot messages
+    if message.author.bot:
+        return
+
+    content = message.content.lower()
+    # allow both the main giver and the admin to bonk
+    if message.author.id in (AUTHORIZED_GIVER_ID, ADMIN_USER_ID) and "bonk" in content:
+        if not bonk_on_cooldown(message.author.id):
+            target_mention = f"<@{TARGET_USER_ID}>"
+            try:
+                await message.channel.send(f"{BONK_EMOJI} BONK! {target_mention} got bonked!")
+            except Exception:
+                pass  # keep bot resilient
+
+    # keep slash commands working alongside on_message
+    await bot.process_commands(message)
 
 # ========= RUN =========
 if not TOKEN:
