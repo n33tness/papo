@@ -17,7 +17,7 @@ CURRENCY = "🍉"
 # 🔒 IDs (edit if they change)
 TARGET_USER_ID = 1028310674318839878         # only this user can gain/lose smuckles AND whose Spotify links we bank
 AUTHORIZED_GIVER_ID = 1422010902680567918    # primary authorized user for /give and /take
-ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, and bonk)
+ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, bonk, and /paposcan)
 
 # Smuckles settings
 VALID_AMOUNTS = (5, 10, 50)                  # allowed increments; 50 is jackpot
@@ -36,7 +36,7 @@ SPOTIFY_REGEX = re.compile(
 
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
-intents.message_content = True  # Needed for bonk + Spotify capture
+intents.message_content = True  # Needed for bonk + Spotify capture + backfill scanning
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
@@ -272,6 +272,65 @@ async def papolinks(interaction: discord.Interaction, limit: int = 10):
         msg = "\n".join(lines)
     await interaction.response.send_message(msg)
 
+# ========= /paposcan (admin-only backfill of Spotify links) =========
+@bot.tree.command(name="paposcan", description="Admin: scan a channel's history to backfill the target's Spotify links")
+@app_commands.describe(
+    channel="Text channel to scan",
+    limit="Max messages to scan (50–5000, default 1000)"
+)
+async def paposcan(interaction: discord.Interaction, channel: discord.TextChannel, limit: int = 1000):
+    # Admin-only
+    if interaction.user.id != ADMIN_USER_ID:
+        return await interaction.response.send_message("Only the bot admin can run this.", ephemeral=True)
+
+    limit = max(50, min(5000, limit))
+    # Need Read Message History for this channel
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.read_messages and perms.read_message_history):
+        return await interaction.response.send_message("I need **Read Messages** and **Read Message History** in that channel.", ephemeral=True)
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    scanned = 0
+    matched_msgs = 0
+    saved_urls = 0
+
+    try:
+        # oldest_first=True so we scan in chronological order (nice for first-time backfills)
+        async for msg in channel.history(limit=limit, oldest_first=True):
+            scanned += 1
+            if msg.author and msg.author.id == TARGET_USER_ID:
+                urls = SPOTIFY_REGEX.findall(msg.content or "")
+                if urls:
+                    matched_msgs += 1
+                    await save_spotify_links(
+                        guild_id=interaction.guild_id,
+                        user_id=TARGET_USER_ID,
+                        channel_id=channel.id,
+                        message_id=msg.id,
+                        urls=urls
+                    )
+                    saved_urls += len(urls)
+
+            # light rate limiter each 200 messages
+            if scanned % 200 == 0:
+                await asyncio.sleep(0.3)
+
+    except discord.Forbidden:
+        return await interaction.followup.send("I don't have permission to read that channel’s history.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"HTTP error while scanning: {e}", ephemeral=True)
+    except Exception as e:
+        return await interaction.followup.send(f"Unexpected error: {e}", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ Scan complete for {channel.mention}\n"
+        f"- Messages scanned: **{scanned}**\n"
+        f"- Messages with Spotify links from <@{TARGET_USER_ID}>: **{matched_msgs}**\n"
+        f"- URLs saved (deduped): **{saved_urls}**",
+        ephemeral=True
+    )
+
 # ========= BONK EMOTE TRIGGER + SPOTIFY BANK CAPTURE =========
 @bot.event
 async def on_message(message: discord.Message):
@@ -289,9 +348,9 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-    # spotify
+    # spotify (live capture)
     if message.author.id == TARGET_USER_ID:
-        urls = SPOTIFY_REGEX.findall(message.content)
+        urls = SPOTIFY_REGEX.findall(message.content or "")
         if urls:
             try:
                 await save_spotify_links(
