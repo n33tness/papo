@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import asyncpg
 import discord
@@ -14,7 +15,7 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-gui
 CURRENCY = "🍉"
 
 # 🔒 IDs (edit if they change)
-TARGET_USER_ID = 1028310674318839878         # only this user can gain/lose smuckles
+TARGET_USER_ID = 1028310674318839878         # only this user can gain/lose smuckles AND whose Spotify links we bank
 AUTHORIZED_GIVER_ID = 1422010902680567918    # primary authorized user for /give and /take
 ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, and bonk)
 
@@ -27,10 +28,15 @@ GIVE_COOLDOWN_SECONDS = 8
 BONK_EMOJI = "<:bonk:1427717741481033799>"
 BONK_COOLDOWN_SECONDS = 3
 
+# Spotify detection
+SPOTIFY_REGEX = re.compile(
+    r'(https?://(?:open\.spotify\.com|spotify\.link)/[^\s>]+)',
+    re.IGNORECASE
+)
+
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
-# Needed for the bonk trigger (reading message content)
-intents.message_content = True
+intents.message_content = True  # Needed for bonk + Spotify capture
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
@@ -57,6 +63,19 @@ CREATE TABLE IF NOT EXISTS smuckles_log (
 );
 """
 
+CREATE_SPOTIFY = """
+CREATE TABLE IF NOT EXISTS smuckles_spotify_links (
+  id         BIGSERIAL PRIMARY KEY,
+  guild_id   BIGINT NOT NULL,
+  user_id    BIGINT NOT NULL,
+  channel_id BIGINT NOT NULL,
+  message_id BIGINT NOT NULL,
+  url        TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (guild_id, user_id, message_id, url)
+);
+"""
+
 async def db_init():
     global db_pool
     if not DATABASE_URL:
@@ -65,6 +84,7 @@ async def db_init():
     async with db_pool.acquire() as con:
         await con.execute(CREATE_USERS)
         await con.execute(CREATE_LOG)
+        await con.execute(CREATE_SPOTIFY)
 
 async def adjust_points(guild_id: int, target_id: int, delta: int):
     async with db_pool.acquire() as con:
@@ -92,6 +112,20 @@ async def log_txn(guild_id: int, actor_id: int, target_id: int, delta: int, reas
             "INSERT INTO smuckles_log (guild_id, actor_id, target_id, delta, reason) VALUES ($1,$2,$3,$4,$5)",
             guild_id, actor_id, target_id, delta, reason,
         )
+
+async def save_spotify_links(guild_id: int, user_id: int, channel_id: int, message_id: int, urls: list[str]):
+    if not urls:
+        return
+    async with db_pool.acquire() as con:
+        for u in urls:
+            try:
+                await con.execute(
+                    "INSERT INTO smuckles_spotify_links (guild_id, user_id, channel_id, message_id, url) "
+                    "VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+                    guild_id, user_id, channel_id, message_id, u
+                )
+            except Exception:
+                pass  # ignore duplicates or bad inserts
 
 # ========= HELPERS =========
 def is_admin(user_id: int) -> bool:
@@ -125,10 +159,10 @@ async def on_ready():
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)   # instant registration in your server
+        await bot.tree.sync(guild=guild)
         print(f"✅ Synced guild commands to {GUILD_ID} as {bot.user}")
     else:
-        await bot.tree.sync()              # global (can be slower to appear)
+        await bot.tree.sync()
         print(f"✅ Synced global commands as {bot.user}")
 
 # ========= /papoping =========
@@ -207,24 +241,69 @@ async def sandia(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMI
 
     await interaction.response.send_message("🏆 **Sandia Leaderboard**\n" + "\n".join(lines))
 
-# ========= BONK EMOTE TRIGGER =========
+# ========= /papolinks (Spotify link history) =========
+@bot.tree.command(name="papolinks", description="Recent Spotify links posted by the target user")
+@app_commands.describe(limit="How many to show (default 10, max 50)")
+async def papolinks(interaction: discord.Interaction, limit: int = 10):
+    limit = max(1, min(50, limit))
+    async with db_pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT url, created_at FROM smuckles_spotify_links "
+            "WHERE guild_id=$1 AND user_id=$2 "
+            "ORDER BY created_at DESC LIMIT $3",
+            interaction.guild_id, TARGET_USER_ID, limit
+        )
+        total_count = await con.fetchval(
+            "SELECT COUNT(*) FROM smuckles_spotify_links WHERE guild_id=$1 AND user_id=$2",
+            interaction.guild_id, TARGET_USER_ID
+        )
+
+    if not rows:
+        return await interaction.response.send_message("No Spotify links found yet.", ephemeral=False)
+
+    lines = [f"🎵 **Spotify history for <@{TARGET_USER_ID}>** (showing {len(rows)}/{total_count}):"]
+    for r in rows:
+        url = r["url"]
+        lines.append(f"• {url}")
+    msg = "\n".join(lines)
+    if len(msg) > 1800 and len(rows) > 20:
+        lines = lines[:21]
+        lines.append("… (trimmed)")
+        msg = "\n".join(lines)
+    await interaction.response.send_message(msg)
+
+# ========= BONK EMOTE TRIGGER + SPOTIFY BANK CAPTURE =========
 @bot.event
 async def on_message(message: discord.Message):
-    # ignore bot messages
     if message.author.bot:
         return
 
     content = message.content.lower()
-    # allow both the main giver and the admin to bonk
+
+    # bonk
     if message.author.id in (AUTHORIZED_GIVER_ID, ADMIN_USER_ID) and "bonk" in content:
         if not bonk_on_cooldown(message.author.id):
             target_mention = f"<@{TARGET_USER_ID}>"
             try:
                 await message.channel.send(f"{BONK_EMOJI} BONK! {target_mention} got bonked!")
             except Exception:
-                pass  # keep bot resilient
+                pass
 
-    # keep slash commands working alongside on_message
+    # spotify
+    if message.author.id == TARGET_USER_ID:
+        urls = SPOTIFY_REGEX.findall(message.content)
+        if urls:
+            try:
+                await save_spotify_links(
+                    guild_id=message.guild.id if message.guild else 0,
+                    user_id=message.author.id,
+                    channel_id=message.channel.id,
+                    message_id=message.id,
+                    urls=urls
+                )
+            except Exception:
+                pass
+
     await bot.process_commands(message)
 
 # ========= RUN =========
