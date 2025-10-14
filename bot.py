@@ -28,9 +28,9 @@ GIVE_COOLDOWN_SECONDS = 8
 BONK_EMOJI = "<:bonk:1427717741481033799>"
 BONK_COOLDOWN_SECONDS = 3
 
-# Spotify detection
+# Spotify detection (text + shorteners)
 SPOTIFY_REGEX = re.compile(
-    r'(https?://(?:open\.spotify\.com|spotify\.link)/[^\s>]+)',
+    r'(https?://(?:open\.spotify\.com|spotify\.link|spoti\.fi)/[^\s>]+)',
     re.IGNORECASE
 )
 
@@ -151,6 +151,34 @@ def bonk_on_cooldown(user_id: int) -> bool:
         return True
     last_bonk_ts[user_id] = now
     return False
+
+def extract_spotify_from_message(msg: discord.Message) -> list[str]:
+    """Find spotify links in message content AND embeds."""
+    urls = []
+    # from content
+    urls += SPOTIFY_REGEX.findall(msg.content or "")
+    # from embeds
+    for e in msg.embeds:
+        if e.url:
+            urls += SPOTIFY_REGEX.findall(e.url)
+        if e.description:
+            urls += SPOTIFY_REGEX.findall(e.description)
+        if e.title:
+            urls += SPOTIFY_REGEX.findall(e.title)
+        # sometimes fields hold links
+        for f in (e.fields or []):
+            if f.name:
+                urls += SPOTIFY_REGEX.findall(f.name)
+            if f.value:
+                urls += SPOTIFY_REGEX.findall(f.value)
+    # dedupe preserving order
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 # ========= READY =========
 @bot.event
@@ -276,7 +304,7 @@ async def papolinks(interaction: discord.Interaction, limit: int = 10):
 @bot.tree.command(name="paposcan", description="Admin: scan a channel's history to backfill the target's Spotify links")
 @app_commands.describe(
     channel="Text channel to scan",
-    limit="Max messages to scan (50–5000, default 1000)"
+    limit="Max messages to scan (50–5000, default 1000, newest first)"
 )
 async def paposcan(interaction: discord.Interaction, channel: discord.TextChannel, limit: int = 1000):
     # Admin-only
@@ -296,11 +324,11 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
     saved_urls = 0
 
     try:
-        # oldest_first=True so we scan in chronological order (nice for first-time backfills)
-        async for msg in channel.history(limit=limit, oldest_first=True):
+        # NEW: newest-first to capture latest posts immediately
+        async for msg in channel.history(limit=limit, oldest_first=False):
             scanned += 1
             if msg.author and msg.author.id == TARGET_USER_ID:
-                urls = SPOTIFY_REGEX.findall(msg.content or "")
+                urls = extract_spotify_from_message(msg)
                 if urls:
                     matched_msgs += 1
                     await save_spotify_links(
@@ -325,13 +353,13 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
 
     await interaction.followup.send(
         f"✅ Scan complete for {channel.mention}\n"
-        f"- Messages scanned: **{scanned}**\n"
+        f"- Messages scanned: **{scanned}** (newest → oldest)\n"
         f"- Messages with Spotify links from <@{TARGET_USER_ID}>: **{matched_msgs}**\n"
         f"- URLs saved (deduped): **{saved_urls}**",
         ephemeral=True
     )
 
-# ========= BONK EMOTE TRIGGER + SPOTIFY BANK CAPTURE =========
+# ========= BONK EMOTE TRIGGER + SPOTIFY LIVE CAPTURE =========
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -348,9 +376,9 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-    # spotify (live capture)
+    # spotify (live capture) — captures content + embeds
     if message.author.id == TARGET_USER_ID:
-        urls = SPOTIFY_REGEX.findall(message.content or "")
+        urls = extract_spotify_from_message(message)
         if urls:
             try:
                 await save_spotify_links(
