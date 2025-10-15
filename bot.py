@@ -26,7 +26,7 @@ GIVE_COOLDOWN_SECONDS = 8
 
 # Bonk settings
 BONK_EMOJI = "<:bonk:1427717741481033799>"
-BONK_COOLDOWN_SECONDS = 3
+BONK_COOLDOWN_SECONDS = 3  # per-user cooldown to avoid spam
 
 # Spotify detection (text + shorteners)
 SPOTIFY_REGEX = re.compile(
@@ -165,7 +165,6 @@ def extract_spotify_from_message(msg: discord.Message) -> list[str]:
             urls += SPOTIFY_REGEX.findall(e.description)
         if e.title:
             urls += SPOTIFY_REGEX.findall(e.title)
-        # sometimes fields hold links
         for f in (e.fields or []):
             if f.name:
                 urls += SPOTIFY_REGEX.findall(f.name)
@@ -324,7 +323,7 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
     saved_urls = 0
 
     try:
-        # NEW: newest-first to capture latest posts immediately
+        # newest-first to capture latest posts immediately
         async for msg in channel.history(limit=limit, oldest_first=False):
             scanned += 1
             if msg.author and msg.author.id == TARGET_USER_ID:
@@ -340,7 +339,6 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
                     )
                     saved_urls += len(urls)
 
-            # light rate limiter each 200 messages
             if scanned % 200 == 0:
                 await asyncio.sleep(0.3)
 
@@ -367,8 +365,9 @@ async def on_message(message: discord.Message):
 
     content = message.content.lower()
 
-    # bonk
-    if message.author.id in (AUTHORIZED_GIVER_ID, ADMIN_USER_ID) and "bonk" in content:
+    # --- BONK FOR EVERYONE ---
+    # Any user typing "bonk" in a server channel triggers a bonk on the target (rate-limited per user)
+    if message.guild and "bonk" in content:
         if not bonk_on_cooldown(message.author.id):
             target_mention = f"<@{TARGET_USER_ID}>"
             try:
@@ -376,7 +375,7 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-    # spotify (live capture) — captures content + embeds
+    # --- SPOTIFY (live capture) — captures content + embeds from the target user
     if message.author.id == TARGET_USER_ID:
         urls = extract_spotify_from_message(message)
         if urls:
