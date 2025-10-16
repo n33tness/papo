@@ -11,22 +11,23 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-guild sync
 
-# 🍉 Currency symbol
-CURRENCY = "🍉"
+# 🍜 Currency / theme
+CURRENCY_EMOJI = "🍉"            # keep your watermelon emoji
+CURRENCY_NAME  = "golden noodles"  # renamed from "smuckles"
 
 # 🔒 IDs (edit if they change)
-TARGET_USER_ID = 1028310674318839878         # only this user can gain/lose smuckles AND whose Spotify links we bank
+TARGET_USER_ID = 1028310674318839878         # the only user who can gain/lose golden noodles + Spotify tracking
 AUTHORIZED_GIVER_ID = 1422010902680567918    # primary authorized user for /give and /take
-ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, bonk, and /paposcan)
+ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, bonk, scans, remindbank)
 
-# Smuckles settings
+# Golden noodles settings
 VALID_AMOUNTS = (5, 10, 50)                  # allowed increments; 50 is jackpot
 LEADERBOARD_LIMIT_DEFAULT = 10
 GIVE_COOLDOWN_SECONDS = 8
 
 # Bonk settings
 BONK_EMOJI = "<:bonk:1427717741481033799>"
-BONK_COOLDOWN_SECONDS = 3  # per-user cooldown to avoid spam
+BONK_COOLDOWN_SECONDS = 3  # per-user cooldown
 
 # Spotify detection (text + shorteners)
 SPOTIFY_REGEX = re.compile(
@@ -36,7 +37,7 @@ SPOTIFY_REGEX = re.compile(
 
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
-intents.message_content = True  # Needed for bonk + Spotify capture + backfill scanning
+intents.message_content = True  # Needed for bonk + Spotify capture + backfill + reminder capture
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
@@ -76,6 +77,19 @@ CREATE TABLE IF NOT EXISTS smuckles_spotify_links (
 );
 """
 
+CREATE_REMINDERS = """
+CREATE TABLE IF NOT EXISTS smuckles_reminders (
+  id         BIGSERIAL PRIMARY KEY,
+  guild_id   BIGINT NOT NULL,
+  author_id  BIGINT NOT NULL,
+  channel_id BIGINT NOT NULL,
+  message_id BIGINT NOT NULL,
+  mentions   TEXT,         -- comma-separated user IDs mentioned in the reminder
+  note       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
 async def db_init():
     global db_pool
     if not DATABASE_URL:
@@ -85,6 +99,7 @@ async def db_init():
         await con.execute(CREATE_USERS)
         await con.execute(CREATE_LOG)
         await con.execute(CREATE_SPOTIFY)
+        await con.execute(CREATE_REMINDERS)
 
 async def adjust_points(guild_id: int, target_id: int, delta: int):
     async with db_pool.acquire() as con:
@@ -127,6 +142,14 @@ async def save_spotify_links(guild_id: int, user_id: int, channel_id: int, messa
             except Exception:
                 pass  # ignore duplicates or bad inserts
 
+async def save_reminder(guild_id: int, author_id: int, channel_id: int, message_id: int, mentions_text: str, note: str):
+    async with db_pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO smuckles_reminders (guild_id, author_id, channel_id, message_id, mentions, note) "
+            "VALUES ($1,$2,$3,$4,$5,$6)",
+            guild_id, author_id, channel_id, message_id, mentions_text, note
+        )
+
 # ========= HELPERS =========
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_USER_ID
@@ -155,9 +178,7 @@ def bonk_on_cooldown(user_id: int) -> bool:
 def extract_spotify_from_message(msg: discord.Message) -> list[str]:
     """Find spotify links in message content AND embeds."""
     urls = []
-    # from content
     urls += SPOTIFY_REGEX.findall(msg.content or "")
-    # from embeds
     for e in msg.embeds:
         if e.url:
             urls += SPOTIFY_REGEX.findall(e.url)
@@ -179,6 +200,19 @@ def extract_spotify_from_message(msg: discord.Message) -> list[str]:
             out.append(u)
     return out
 
+def extract_reminder_note(raw_content: str) -> str | None:
+    # Grab everything after the first "remind"
+    if not raw_content:
+        return None
+    low = raw_content.lower()
+    idx = low.find("remind")
+    if idx == -1:
+        return None
+    note = raw_content[idx + len("remind"):].strip()
+    # strip leading punctuation or "me/to" etc.
+    note = re.sub(r"^(me|us|to|@?\w+)?\s*", "", note, flags=re.IGNORECASE)
+    return note if note else None
+
 # ========= READY =========
 @bot.event
 async def on_ready():
@@ -196,16 +230,16 @@ async def on_ready():
 @bot.tree.command(name="papoping", description="Check if the bot is alive and running")
 async def papoping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
-    await interaction.response.send_message(f"🍉 Papo is online! Ping: `{latency}ms`")
+    await interaction.response.send_message(f"{CURRENCY_EMOJI} Papo is online! Ping: `{latency}ms`")
 
 # ========= /give =========
-@bot.tree.command(description="Give smuckles to the designated member (5, 10, or 50)")
+@bot.tree.command(description=f"Give {CURRENCY_NAME} to the designated member (5, 10, or 50)")
 @app_commands.describe(member="Must be the designated member", amount="5, 10, or 50", reason="Optional reason")
 async def give(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
     if not is_authorized_actor(interaction.user.id):
-        return await interaction.response.send_message("Only authorized users can give smuckles.", ephemeral=True)
+        return await interaction.response.send_message(f"Only authorized users can give {CURRENCY_NAME}.", ephemeral=True)
     if member.id != TARGET_USER_ID:
-        return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can receive {CURRENCY} smuckles.", ephemeral=True)
+        return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can receive {CURRENCY_EMOJI} {CURRENCY_NAME}.", ephemeral=True)
     if amount not in VALID_AMOUNTS:
         return await interaction.response.send_message("Amount must be **5**, **10**, or **50**.", ephemeral=True)
     if on_cooldown(interaction.user.id) and not is_admin(interaction.user.id):
@@ -216,21 +250,21 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     total = await get_points(interaction.guild_id, member.id)
 
     if amount == 50:
-        text = f"🎰 JACKPOT! {member.mention} hit **{amount} {CURRENCY}**! Total: **{total} {CURRENCY}**."
+        text = f"🎰 JACKPOT! {member.mention} hit **{amount} {CURRENCY_EMOJI}** {CURRENCY_NAME}! Total: **{total} {CURRENCY_EMOJI}**."
     else:
-        text = f"✅ {member.mention} received **{amount} {CURRENCY} smuckles**. New total: **{total} {CURRENCY}**."
+        text = f"✅ {member.mention} received **{amount} {CURRENCY_EMOJI} {CURRENCY_NAME}**. New total: **{total} {CURRENCY_EMOJI}**."
         if reason:
             text += f" (_{reason}_)"
     await interaction.response.send_message(text)
 
 # ========= /take =========
-@bot.tree.command(description="Take smuckles from the designated member (5, 10, or 50)")
+@bot.tree.command(description=f"Take {CURRENCY_NAME} from the designated member (5, 10, or 50)")
 @app_commands.describe(member="Must be the designated member", amount="5, 10, or 50", reason="Optional reason")
 async def take(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
     if not is_authorized_actor(interaction.user.id):
-        return await interaction.response.send_message("Only authorized users can take smuckles.", ephemeral=True)
+        return await interaction.response.send_message(f"Only authorized users can take {CURRENCY_NAME}.", ephemeral=True)
     if member.id != TARGET_USER_ID:
-        return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can have smuckles taken away.", ephemeral=True)
+        return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can have {CURRENCY_NAME} taken away.", ephemeral=True)
     if amount not in VALID_AMOUNTS:
         return await interaction.response.send_message("Amount must be **5**, **10**, or **50**.", ephemeral=True)
 
@@ -238,13 +272,13 @@ async def take(interaction: discord.Interaction, member: discord.Member, amount:
     await log_txn(interaction.guild_id, interaction.user.id, member.id, -amount, reason)
     total = await get_points(interaction.guild_id, member.id)
 
-    text = f"⚠️ {member.mention} lost **{amount} {CURRENCY}**. New total: **{total} {CURRENCY}**."
+    text = f"⚠️ {member.mention} lost **{amount} {CURRENCY_EMOJI}**. New total: **{total} {CURRENCY_EMOJI}**."
     if reason:
         text += f" (_{reason}_)"
     await interaction.response.send_message(text)
 
 # ========= /sandia (leaderboard) =========
-@bot.tree.command(name="sandia", description="Top members by smuckles (🍉 leaderboard)")
+@bot.tree.command(name="sandia", description=f"Top members by {CURRENCY_NAME} ({CURRENCY_EMOJI} leaderboard)")
 @app_commands.describe(limit="How many to show (default 10, max 30)")
 async def sandia(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMIT_DEFAULT):
     limit = max(1, min(30, limit))
@@ -254,7 +288,7 @@ async def sandia(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMI
             interaction.guild_id, limit,
         )
     if not rows:
-        return await interaction.response.send_message("No smuckles yet. Be the first to give some!")
+        return await interaction.response.send_message(f"No {CURRENCY_NAME} yet. Be the first to give some!")
 
     lines = []
     for i, r in enumerate(rows, start=1):
@@ -264,8 +298,7 @@ async def sandia(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMI
             name = member.display_name if member else f"<@{uid}>"
         except Exception:
             name = f"<@{uid}>"
-        lines.append(f"{i}. **{name}** — {pts} {CURRENCY}")
-
+        lines.append(f"{i}. **{name}** — {pts} {CURRENCY_EMOJI}")
     await interaction.response.send_message("🏆 **Sandia Leaderboard**\n" + "\n".join(lines))
 
 # ========= /papolinks (Spotify link history) =========
@@ -306,12 +339,10 @@ async def papolinks(interaction: discord.Interaction, limit: int = 10):
     limit="Max messages to scan (50–5000, default 1000, newest first)"
 )
 async def paposcan(interaction: discord.Interaction, channel: discord.TextChannel, limit: int = 1000):
-    # Admin-only
     if interaction.user.id != ADMIN_USER_ID:
         return await interaction.response.send_message("Only the bot admin can run this.", ephemeral=True)
 
     limit = max(50, min(5000, limit))
-    # Need Read Message History for this channel
     perms = channel.permissions_for(interaction.guild.me)
     if not (perms.read_messages and perms.read_message_history):
         return await interaction.response.send_message("I need **Read Messages** and **Read Message History** in that channel.", ephemeral=True)
@@ -323,7 +354,6 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
     saved_urls = 0
 
     try:
-        # newest-first to capture latest posts immediately
         async for msg in channel.history(limit=limit, oldest_first=False):
             scanned += 1
             if msg.author and msg.author.id == TARGET_USER_ID:
@@ -357,17 +387,61 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
         ephemeral=True
     )
 
-# ========= BONK EMOTE TRIGGER + SPOTIFY LIVE CAPTURE =========
+# ========= /remindbank (admin) & /myreminders =========
+@bot.tree.command(name="remindbank", description="Admin: list recent stored reminder requests")
+@app_commands.describe(limit="How many to show (default 10, max 50)")
+async def remindbank(interaction: discord.Interaction, limit: int = 10):
+    if interaction.user.id != ADMIN_USER_ID:
+        return await interaction.response.send_message("Only the bot admin can view the full reminder bank.", ephemeral=True)
+    limit = max(1, min(50, limit))
+    async with db_pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT author_id, mentions, note, created_at FROM smuckles_reminders "
+            "WHERE guild_id=$1 ORDER BY created_at DESC LIMIT $2",
+            interaction.guild_id, limit
+        )
+        total = await con.fetchval(
+            "SELECT COUNT(*) FROM smuckles_reminders WHERE guild_id=$1",
+            interaction.guild_id
+        )
+    if not rows:
+        return await interaction.response.send_message("No reminders saved yet.", ephemeral=True)
+    lines = [f"📝 **Reminder Bank** (showing {len(rows)}/{total}):"]
+    for r in rows:
+        who = f"<@{int(r['author_id'])}>"
+        mentions = f" → to: {r['mentions']}" if r['mentions'] else ""
+        lines.append(f"• {who}{mentions}: {r['note']}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+@bot.tree.command(name="myreminders", description="See your own stored reminder requests")
+@app_commands.describe(limit="How many to show (default 10, max 50)")
+async def myreminders(interaction: discord.Interaction, limit: int = 10):
+    limit = max(1, min(50, limit))
+    async with db_pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT mentions, note, created_at FROM smuckles_reminders "
+            "WHERE guild_id=$1 AND author_id=$2 ORDER BY created_at DESC LIMIT $3",
+            interaction.guild_id, interaction.user.id, limit
+        )
+    if not rows:
+        return await interaction.response.send_message("You have no saved reminders yet.", ephemeral=True)
+    lines = [f"🗒️ **Your reminders** (last {len(rows)}):"]
+    for r in rows:
+        mentions = f" → to: {r['mentions']}" if r['mentions'] else ""
+        lines.append(f"• {mentions} {r['note']}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+# ========= BONK + SPOTIFY LIVE + REMINDER CAPTURE =========
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    content = message.content.lower()
+    content = message.content or ""
+    low = content.lower()
 
-    # --- BONK FOR EVERYONE ---
-    # Any user typing "bonk" in a server channel triggers a bonk on the target (rate-limited per user)
-    if message.guild and "bonk" in content:
+    # --- BONK for everyone (server channels only)
+    if message.guild and "bonk" in low:
         if not bonk_on_cooldown(message.author.id):
             target_mention = f"<@{TARGET_USER_ID}>"
             try:
@@ -388,6 +462,31 @@ async def on_message(message: discord.Message):
                     urls=urls
                 )
             except Exception:
+                pass
+
+    # --- REMINDER BANK: if the bot is mentioned + the word "remind" appears
+    try:
+        bot_mentioned = any(user.id == bot.user.id for user in message.mentions) if bot.user else False
+    except Exception:
+        bot_mentioned = False
+
+    if message.guild and bot_mentioned and "remind" in low:
+        note = extract_reminder_note(content)
+        if note:
+            mentions_ids = [str(u.id) for u in message.mentions if u.id != bot.user.id]
+            mentions_text = ", ".join(f"<@{uid}>" for uid in mentions_ids) if mentions_ids else ""
+            try:
+                await save_reminder(
+                    guild_id=message.guild.id,
+                    author_id=message.author.id,
+                    channel_id=message.channel.id,
+                    message_id=message.id,
+                    mentions_text=mentions_text,
+                    note=note[:500]  # cap note length for sanity
+                )
+                await message.channel.send(f"✅ Saved reminder to bank: _{note[:120]}{'…' if len(note)>120 else ''}_")
+            except Exception:
+                # stay quiet on DB failure to avoid noise
                 pass
 
     await bot.process_commands(message)
