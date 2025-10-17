@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import asyncio
 import asyncpg
 import discord
@@ -29,6 +30,7 @@ GIVE_COOLDOWN_SECONDS = 8
 # Bonk settings
 BONK_EMOJI = "<:bonk:1427717741481033799>"
 BONK_COOLDOWN_SECONDS = 3  # per-user cooldown
+BONK_STREAK_STEP = 10      # trigger memes at 10, 20, 30…
 
 # Spotify detection (text + shorteners)
 SPOTIFY_REGEX = re.compile(
@@ -91,6 +93,18 @@ CREATE TABLE IF NOT EXISTS smuckles_reminders (
 );
 """
 
+CREATE_BONK_LOG = """
+CREATE TABLE IF NOT EXISTS smuckles_bonk_log (
+  id         BIGSERIAL PRIMARY KEY,
+  guild_id   BIGINT NOT NULL,
+  bonker_id  BIGINT NOT NULL,
+  target_id  BIGINT NOT NULL,
+  channel_id BIGINT NOT NULL,
+  message_id BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
 async def db_init():
     global db_pool
     if not DATABASE_URL:
@@ -101,6 +115,7 @@ async def db_init():
         await con.execute(CREATE_LOG)
         await con.execute(CREATE_SPOTIFY)
         await con.execute(CREATE_REMINDERS)
+        await con.execute(CREATE_BONK_LOG)
 
 async def adjust_points(guild_id: int, target_id: int, delta: int):
     async with db_pool.acquire() as con:
@@ -141,7 +156,7 @@ async def save_spotify_links(guild_id: int, user_id: int, channel_id: int, messa
                     guild_id, user_id, channel_id, message_id, u
                 )
             except Exception:
-                pass  # ignore duplicates or bad inserts
+                pass
 
 async def save_reminder(guild_id: int, author_id: int, channel_id: int, message_id: int, mentions_text: str, note: str):
     async with db_pool.acquire() as con:
@@ -149,6 +164,36 @@ async def save_reminder(guild_id: int, author_id: int, channel_id: int, message_
             "INSERT INTO smuckles_reminders (guild_id, author_id, channel_id, message_id, mentions, note) "
             "VALUES ($1,$2,$3,$4,$5,$6)",
             guild_id, author_id, channel_id, message_id, mentions_text, note
+        )
+
+async def delete_my_reminders(guild_id: int, author_id: int) -> int:
+    async with db_pool.acquire() as con:
+        return await con.fetchval(
+            "WITH del AS (DELETE FROM smuckles_reminders WHERE guild_id=$1 AND author_id=$2 RETURNING 1) SELECT COUNT(*) FROM del",
+            guild_id, author_id
+        )
+
+async def clear_remind_bank(guild_id: int) -> int:
+    async with db_pool.acquire() as con:
+        return await con.fetchval(
+            "WITH del AS (DELETE FROM smuckles_reminders WHERE guild_id=$1 RETURNING 1) SELECT COUNT(*) FROM del",
+            guild_id
+        )
+
+async def log_bonk(guild_id: int, bonker_id: int, channel_id: int, message_id: int):
+    async with db_pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO smuckles_bonk_log (guild_id, bonker_id, target_id, channel_id, message_id) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            guild_id, bonker_id, TARGET_USER_ID, channel_id, message_id
+        )
+
+async def today_bonk_count(guild_id: int) -> int:
+    async with db_pool.acquire() as con:
+        return await con.fetchval(
+            "SELECT COUNT(*) FROM smuckles_bonk_log "
+            "WHERE guild_id=$1 AND target_id=$2 AND created_at::date = CURRENT_DATE",
+            guild_id, TARGET_USER_ID
         )
 
 # ========= HELPERS =========
@@ -242,7 +287,6 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
         return await interaction.response.send_message(f"Only authorized users can give {CURRENCY_NAME}.", ephemeral=True)
     if member.id != TARGET_USER_ID:
         return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can receive {CURRENCY_EMOJI} {CURRENCY_NAME}.", ephemeral=True)
-    # validate amount
     if not (is_valid_multiple(amount) or amount == JACKPOT):
         return await interaction.response.send_message(
             f"Amount must be a positive multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or exactly {JACKPOT}.",
@@ -271,7 +315,6 @@ async def take(interaction: discord.Interaction, member: discord.Member, amount:
         return await interaction.response.send_message(f"Only authorized users can take {CURRENCY_NAME}.", ephemeral=True)
     if member.id != TARGET_USER_ID:
         return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can have {CURRENCY_NAME} taken away.", ephemeral=True)
-    # validate amount
     if not (is_valid_multiple(amount) or amount == JACKPOT):
         return await interaction.response.send_message(
             f"Amount must be a positive multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or exactly {JACKPOT}.",
@@ -397,7 +440,7 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
         ephemeral=True
     )
 
-# ========= /remindbank (admin) & /myreminders =========
+# ========= Reminder bank commands =========
 @bot.tree.command(name="remindbank", description="Admin: list recent stored reminder requests")
 @app_commands.describe(limit="How many to show (default 10, max 50)")
 async def remindbank(interaction: discord.Interaction, limit: int = 10):
@@ -441,6 +484,18 @@ async def myreminders(interaction: discord.Interaction, limit: int = 10):
         lines.append(f"• {mentions} {r['note']}")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+@bot.tree.command(name="clearmyreminders", description="Delete all of YOUR saved reminders")
+async def clearmyreminders(interaction: discord.Interaction):
+    deleted = await delete_my_reminders(interaction.guild_id, interaction.user.id)
+    await interaction.response.send_message(f"🧹 Deleted **{deleted}** of your reminders.", ephemeral=True)
+
+@bot.tree.command(name="clearemindbank", description="Admin: wipe the entire reminder bank for this server")
+async def clearemindbank(interaction: discord.Interaction):
+    if interaction.user.id != ADMIN_USER_ID:
+        return await interaction.response.send_message("Only the bot admin can wipe the reminder bank.", ephemeral=True)
+    deleted = await clear_remind_bank(interaction.guild_id)
+    await interaction.response.send_message(f"🧨 Cleared the reminder bank. Removed **{deleted}** entries.", ephemeral=True)
+
 # ========= BONK + SPOTIFY LIVE + REMINDER CAPTURE =========
 @bot.event
 async def on_message(message: discord.Message):
@@ -450,12 +505,34 @@ async def on_message(message: discord.Message):
     content = message.content or ""
     low = content.lower()
 
-    # --- BONK for everyone (server channels only)
+    # --- BONK for everyone (server channels only) ---
     if message.guild and "bonk" in low:
         if not bonk_on_cooldown(message.author.id):
             target_mention = f"<@{TARGET_USER_ID}>"
             try:
                 await message.channel.send(f"{BONK_EMOJI} BONK! {target_mention} got bonked!")
+            except Exception:
+                pass
+
+            # Log bonk + check streaks
+            try:
+                await log_bonk(
+                    guild_id=message.guild.id,
+                    bonker_id=message.author.id,
+                    channel_id=message.channel.id,
+                    message_id=message.id
+                )
+                count_today = await today_bonk_count(message.guild.id)
+                # Trigger memes at 10, 20, 30, ...
+                if count_today % BONK_STREAK_STEP == 0:
+                    memes = [
+                        "💀 Papo has been bonked into another dimension.",
+                        "🧠 Memory corrupted by excessive bonks.",
+                        "🚑 Paramedics called. Bonk overdose detected.",
+                        "<a:endisnear:1416071184629497856> Papo's demise is inevitable.",
+                        "🔨 World record bonk streak achieved!",
+                    ]
+                    await message.channel.send(random.choice(memes))
             except Exception:
                 pass
 
