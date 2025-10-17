@@ -31,6 +31,8 @@ GIVE_COOLDOWN_SECONDS = 8
 BONK_EMOJI = "<:bonk:1427717741481033799>"
 BONK_COOLDOWN_SECONDS = 3  # per-user cooldown
 BONK_STREAK_STEP = 10      # trigger memes at 10, 20, 30…
+BONK_PENALTY_STEP = 20     # every 20 bonks -> -5 noodles
+BONK_PENALTY_AMOUNT = 5
 
 # Spotify detection (text + shorteners)
 SPOTIFY_REGEX = re.compile(
@@ -322,6 +324,47 @@ async def papoping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"{CURRENCY_EMOJI} Papo is online! Ping: `{latency}ms`")
 
+# ========= /papohelp =========
+@bot.tree.command(name="papohelp", description="Show everything Papo can do")
+async def papohelp(interaction: discord.Interaction):
+    target = f"<@{TARGET_USER_ID}>"
+    giver  = f"<@{AUTHORIZED_GIVER_ID}>"
+    admin  = f"<@{ADMIN_USER_ID}>"
+
+    msg = (
+        "## 🤖 Papo Command Guide\n"
+        f"**Target:** {target}\n"
+        f"**Giver:** {giver}\n"
+        f"**Admin:** {admin}\n\n"
+
+        "### 🍜 Golden Noodles\n"
+        f"• `/give @member amount reason` — (giver/admin) multiples of 5, or 100 for JACKPOT. Only {target} can receive.\n"
+        f"• `/take @member amount reason` — (giver/admin) multiples of 5, or 100. Only affects {target}.\n"
+        "• `/sandia [limit]` — leaderboard of golden noodles.\n\n"
+
+        "### 🔨 Bonks\n"
+        f"• Type `bonk` in chat to bonk {target} (3s personal cooldown).\n"
+        "• Streak memes at 10, 20, 30… bonks per day.\n"
+        "• `/bonkstats [member]` — bonks today/week/all-time.\n"
+        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n\n"
+
+        "### 🎵 Spotify Memory\n"
+        f"• Auto-saves Spotify links from {target}.\n"
+        "• `/papolinks [limit]` — recent Spotify links.\n"
+        "• `/paposcan channel:[#channel] [limit]` — (admin) backfill scan.\n\n"
+
+        "### 🗒️ Reminder Bank\n"
+        "• Mention the bot + say **remind ...** to save a reminder.\n"
+        "• `/myreminders [limit]` — your reminders.\n"
+        "• `/clearmyreminders` — delete your reminders.\n"
+        "• `/remindbank [limit]` — (admin) view recent reminders.\n"
+        "• `/clearemindbank` — (admin) wipe all reminders.\n\n"
+
+        "### 🧪 Utility\n"
+        "• `/papoping` — latency test.\n"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
 # ========= /give =========
 @bot.tree.command(description=f"Give {CURRENCY_NAME} to the designated member (multiples of {MULTIPLE_OF}, jackpot {JACKPOT})")
 @app_commands.describe(member="Must be the designated member", amount=f"Multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or {JACKPOT}", reason="Optional reason")
@@ -586,7 +629,7 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-            # Log bonk + check streaks
+            # Log bonk + check streaks and penalties
             try:
                 await log_bonk(
                     guild_id=message.guild.id,
@@ -595,6 +638,8 @@ async def on_message(message: discord.Message):
                     message_id=message.id
                 )
                 count_today = await today_bonk_count(message.guild.id)
+
+                # 🎭 meme milestones at 10, 20, 30...
                 if count_today % BONK_STREAK_STEP == 0:
                     memes = [
                         "💀 Papo has been bonked into another dimension.",
@@ -604,10 +649,30 @@ async def on_message(message: discord.Message):
                         "🔨 World record bonk streak achieved!",
                     ]
                     await message.channel.send(random.choice(memes))
-            except Exception:
-                pass
 
-    # --- SPOTIFY (live capture)
+                # 💸 every 20 bonks deduct 5 noodles (and log it)
+                if count_today % BONK_PENALTY_STEP == 0:
+                    await adjust_points(message.guild.id, TARGET_USER_ID, -BONK_PENALTY_AMOUNT)
+                    actor_id = bot.user.id if bot.user else ADMIN_USER_ID
+                    await log_txn(
+                        guild_id=message.guild.id,
+                        actor_id=actor_id,
+                        target_id=TARGET_USER_ID,
+                        delta=-BONK_PENALTY_AMOUNT,
+                        reason=f"{BONK_PENALTY_STEP}-bonk penalty"
+                    )
+                    total = await get_points(message.guild.id, TARGET_USER_ID)
+                    await message.channel.send(
+                        f"💀 {target_mention} has been bonked **{count_today}** times today and loses "
+                        f"**{BONK_PENALTY_AMOUNT} {CURRENCY_EMOJI} {CURRENCY_NAME}**!\n"
+                        f"New total: **{total} {CURRENCY_EMOJI}**."
+                    )
+
+            except Exception as e:
+                # Keep bot resilient; just log to console
+                print("Bonk handling error:", e)
+
+    # --- SPOTIFY (live capture) — captures content + embeds from the target user
     if message.author.id == TARGET_USER_ID:
         urls = []
         urls += SPOTIFY_REGEX.findall(message.content or "")
