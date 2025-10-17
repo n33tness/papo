@@ -19,7 +19,7 @@ CURRENCY_NAME  = "golden noodles"   # renamed from "smuckles"
 # 🔒 IDs (edit if they change)
 TARGET_USER_ID = 1028310674318839878         # the only user who can gain/lose golden noodles + Spotify tracking
 AUTHORIZED_GIVER_ID = 1422010902680567918    # primary authorized user for /give and /take
-ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, bonk, scans, remindbank)
+ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, scans, remindbank)
 
 # Golden noodles settings
 MULTIPLE_OF = 5          # any positive multiple of 5 is allowed
@@ -117,6 +117,7 @@ async def db_init():
         await con.execute(CREATE_REMINDERS)
         await con.execute(CREATE_BONK_LOG)
 
+# ======== Golden Noodles ========
 async def adjust_points(guild_id: int, target_id: int, delta: int):
     async with db_pool.acquire() as con:
         async with con.transaction():
@@ -144,6 +145,7 @@ async def log_txn(guild_id: int, actor_id: int, target_id: int, delta: int, reas
             guild_id, actor_id, target_id, delta, reason,
         )
 
+# ======== Spotify ========
 async def save_spotify_links(guild_id: int, user_id: int, channel_id: int, message_id: int, urls: list[str]):
     if not urls:
         return
@@ -158,6 +160,7 @@ async def save_spotify_links(guild_id: int, user_id: int, channel_id: int, messa
             except Exception:
                 pass
 
+# ======== Reminders ========
 async def save_reminder(guild_id: int, author_id: int, channel_id: int, message_id: int, mentions_text: str, note: str):
     async with db_pool.acquire() as con:
         await con.execute(
@@ -180,6 +183,7 @@ async def clear_remind_bank(guild_id: int) -> int:
             guild_id
         )
 
+# ======== Bonks ========
 async def log_bonk(guild_id: int, bonker_id: int, channel_id: int, message_id: int):
     async with db_pool.acquire() as con:
         await con.execute(
@@ -195,6 +199,45 @@ async def today_bonk_count(guild_id: int) -> int:
             "WHERE guild_id=$1 AND target_id=$2 AND created_at::date = CURRENT_DATE",
             guild_id, TARGET_USER_ID
         )
+
+async def bonk_counts_for_user(guild_id: int, bonker_id: int) -> tuple[int, int, int]:
+    """Return (today, week, all_time) for a given bonker vs the TARGET."""
+    async with db_pool.acquire() as con:
+        today = await con.fetchval(
+            "SELECT COUNT(*) FROM smuckles_bonk_log "
+            "WHERE guild_id=$1 AND target_id=$2 AND bonker_id=$3 AND created_at::date = CURRENT_DATE",
+            guild_id, TARGET_USER_ID, bonker_id
+        )
+        week = await con.fetchval(
+            "SELECT COUNT(*) FROM smuckles_bonk_log "
+            "WHERE guild_id=$1 AND target_id=$2 AND bonker_id=$3 AND created_at >= (NOW() - INTERVAL '7 days')",
+            guild_id, TARGET_USER_ID, bonker_id
+        )
+        all_time = await con.fetchval(
+            "SELECT COUNT(*) FROM smuckles_bonk_log "
+            "WHERE guild_id=$1 AND target_id=$2 AND bonker_id=$3",
+            guild_id, TARGET_USER_ID, bonker_id
+        )
+    return int(today or 0), int(week or 0), int(all_time or 0)
+
+async def bonk_leaderboard(guild_id: int, window: str, limit: int):
+    """Return list[(bonker_id, count)] ordered desc for 'all'|'day'|'week'."""
+    where = "guild_id=$1 AND target_id=$2"
+    if window == "day":
+        where += " AND created_at::date = CURRENT_DATE"
+    elif window == "week":
+        where += " AND created_at >= (NOW() - INTERVAL '7 days')"
+    sql = f"""
+        SELECT bonker_id, COUNT(*) AS c
+        FROM smuckles_bonk_log
+        WHERE {where}
+        GROUP BY bonker_id
+        ORDER BY c DESC
+        LIMIT $3
+    """
+    async with db_pool.acquire() as con:
+        rows = await con.fetch(sql, guild_id, TARGET_USER_ID, limit)
+    return [(int(r["bonker_id"]), int(r["c"])) for r in rows]
 
 # ========= HELPERS =========
 def is_admin(user_id: int) -> bool:
@@ -496,6 +539,35 @@ async def clearemindbank(interaction: discord.Interaction):
     deleted = await clear_remind_bank(interaction.guild_id)
     await interaction.response.send_message(f"🧨 Cleared the reminder bank. Removed **{deleted}** entries.", ephemeral=True)
 
+# ========= Bonk stats / leaderboard =========
+@bot.tree.command(name="bonkstats", description="Show how many times someone has bonked the target (today/week/all-time)")
+@app_commands.describe(member="Member to check (defaults to you)")
+async def bonkstats(interaction: discord.Interaction, member: discord.Member | None = None):
+    target_member = member or interaction.user
+    today, week, all_time = await bonk_counts_for_user(interaction.guild_id, target_member.id)
+    await interaction.response.send_message(
+        f"🔨 **Bonk stats for {target_member.mention} → <@{TARGET_USER_ID}>**\n"
+        f"• Today: **{today}**\n"
+        f"• Last 7 days: **{week}**\n"
+        f"• All-time: **{all_time}**"
+    )
+
+@bot.tree.command(name="bonktop", description="Leaderboard of who bonks the target the most")
+@app_commands.describe(limit="How many to show (1–30, default 10)", window="all | day | week")
+async def bonktop(interaction: discord.Interaction, limit: int = 10, window: str = "all"):
+    limit = max(1, min(30, limit))
+    window = window.lower().strip()
+    if window not in ("all", "day", "week"):
+        return await interaction.response.send_message("`window` must be one of: **all**, **day**, **week**.", ephemeral=True)
+    rows = await bonk_leaderboard(interaction.guild_id, window, limit)
+    if not rows:
+        return await interaction.response.send_message("No bonks logged yet.")
+    title = {"all": "All-Time", "day": "Today", "week": "This Week"}[window]
+    lines = [f"🏅 **Bonk Top — {title}** (→ <@{TARGET_USER_ID}>)"]
+    for i, (uid, c) in enumerate(rows, start=1):
+        lines.append(f"{i}. <@{uid}> — **{c}**")
+    await interaction.response.send_message("\n".join(lines))
+
 # ========= BONK + SPOTIFY LIVE + REMINDER CAPTURE =========
 @bot.event
 async def on_message(message: discord.Message):
@@ -523,7 +595,6 @@ async def on_message(message: discord.Message):
                     message_id=message.id
                 )
                 count_today = await today_bonk_count(message.guild.id)
-                # Trigger memes at 10, 20, 30, ...
                 if count_today % BONK_STREAK_STEP == 0:
                     memes = [
                         "💀 Papo has been bonked into another dimension.",
@@ -536,17 +607,30 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-    # --- SPOTIFY (live capture) — captures content + embeds from the target user
+    # --- SPOTIFY (live capture)
     if message.author.id == TARGET_USER_ID:
-        urls = extract_spotify_from_message(message)
+        urls = []
+        urls += SPOTIFY_REGEX.findall(message.content or "")
+        for e in message.embeds:
+            if e.url: urls += SPOTIFY_REGEX.findall(e.url)
+            if e.description: urls += SPOTIFY_REGEX.findall(e.description)
+            if e.title: urls += SPOTIFY_REGEX.findall(e.title)
+            for f in (e.fields or []):
+                if f.name: urls += SPOTIFY_REGEX.findall(f.name)
+                if f.value: urls += SPOTIFY_REGEX.findall(f.value)
+        # dedupe
         if urls:
+            seen, unique = set(), []
+            for u in urls:
+                if u not in seen:
+                    seen.add(u); unique.append(u)
             try:
                 await save_spotify_links(
                     guild_id=message.guild.id if message.guild else 0,
                     user_id=message.author.id,
                     channel_id=message.channel.id,
                     message_id=message.id,
-                    urls=urls
+                    urls=unique
                 )
             except Exception:
                 pass
