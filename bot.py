@@ -12,8 +12,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-guild sync
 
 # 🍜 Currency / theme
-CURRENCY_EMOJI = "🍉"            # keep your watermelon emoji
-CURRENCY_NAME  = "golden noodles"  # renamed from "smuckles"
+CURRENCY_EMOJI = "🍉"               # your watermelon vibe
+CURRENCY_NAME  = "golden noodles"   # renamed from "smuckles"
 
 # 🔒 IDs (edit if they change)
 TARGET_USER_ID = 1028310674318839878         # the only user who can gain/lose golden noodles + Spotify tracking
@@ -21,7 +21,8 @@ AUTHORIZED_GIVER_ID = 1422010902680567918    # primary authorized user for /give
 ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, bonk, scans, remindbank)
 
 # Golden noodles settings
-VALID_AMOUNTS = (5, 10, 50)                  # allowed increments; 50 is jackpot
+MULTIPLE_OF = 5          # any positive multiple of 5 is allowed
+JACKPOT = 100            # special jackpot amount
 LEADERBOARD_LIMIT_DEFAULT = 10
 GIVE_COOLDOWN_SECONDS = 8
 
@@ -84,7 +85,7 @@ CREATE TABLE IF NOT EXISTS smuckles_reminders (
   author_id  BIGINT NOT NULL,
   channel_id BIGINT NOT NULL,
   message_id BIGINT NOT NULL,
-  mentions   TEXT,         -- comma-separated user IDs mentioned in the reminder
+  mentions   TEXT,
   note       TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -157,6 +158,9 @@ def is_admin(user_id: int) -> bool:
 def is_authorized_actor(user_id: int) -> bool:
     return user_id in (AUTHORIZED_GIVER_ID, ADMIN_USER_ID)
 
+def is_valid_multiple(amount: int) -> bool:
+    return amount > 0 and amount % MULTIPLE_OF == 0
+
 last_give_ts: dict[int, float] = {}
 def on_cooldown(user_id: int) -> bool:
     now = asyncio.get_event_loop().time()
@@ -201,7 +205,6 @@ def extract_spotify_from_message(msg: discord.Message) -> list[str]:
     return out
 
 def extract_reminder_note(raw_content: str) -> str | None:
-    # Grab everything after the first "remind"
     if not raw_content:
         return None
     low = raw_content.lower()
@@ -209,7 +212,6 @@ def extract_reminder_note(raw_content: str) -> str | None:
     if idx == -1:
         return None
     note = raw_content[idx + len("remind"):].strip()
-    # strip leading punctuation or "me/to" etc.
     note = re.sub(r"^(me|us|to|@?\w+)?\s*", "", note, flags=re.IGNORECASE)
     return note if note else None
 
@@ -233,15 +235,19 @@ async def papoping(interaction: discord.Interaction):
     await interaction.response.send_message(f"{CURRENCY_EMOJI} Papo is online! Ping: `{latency}ms`")
 
 # ========= /give =========
-@bot.tree.command(description=f"Give {CURRENCY_NAME} to the designated member (5, 10, or 50)")
-@app_commands.describe(member="Must be the designated member", amount="5, 10, or 50", reason="Optional reason")
+@bot.tree.command(description=f"Give {CURRENCY_NAME} to the designated member (multiples of {MULTIPLE_OF}, jackpot {JACKPOT})")
+@app_commands.describe(member="Must be the designated member", amount=f"Multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or {JACKPOT}", reason="Optional reason")
 async def give(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
     if not is_authorized_actor(interaction.user.id):
         return await interaction.response.send_message(f"Only authorized users can give {CURRENCY_NAME}.", ephemeral=True)
     if member.id != TARGET_USER_ID:
         return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can receive {CURRENCY_EMOJI} {CURRENCY_NAME}.", ephemeral=True)
-    if amount not in VALID_AMOUNTS:
-        return await interaction.response.send_message("Amount must be **5**, **10**, or **50**.", ephemeral=True)
+    # validate amount
+    if not (is_valid_multiple(amount) or amount == JACKPOT):
+        return await interaction.response.send_message(
+            f"Amount must be a positive multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or exactly {JACKPOT}.",
+            ephemeral=True
+        )
     if on_cooldown(interaction.user.id) and not is_admin(interaction.user.id):
         return await interaction.response.send_message("Slow down — try again in a few seconds.", ephemeral=True)
 
@@ -249,7 +255,7 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     await log_txn(interaction.guild_id, interaction.user.id, member.id, amount, reason)
     total = await get_points(interaction.guild_id, member.id)
 
-    if amount == 50:
+    if amount == JACKPOT:
         text = f"🎰 JACKPOT! {member.mention} hit **{amount} {CURRENCY_EMOJI}** {CURRENCY_NAME}! Total: **{total} {CURRENCY_EMOJI}**."
     else:
         text = f"✅ {member.mention} received **{amount} {CURRENCY_EMOJI} {CURRENCY_NAME}**. New total: **{total} {CURRENCY_EMOJI}**."
@@ -258,15 +264,19 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
     await interaction.response.send_message(text)
 
 # ========= /take =========
-@bot.tree.command(description=f"Take {CURRENCY_NAME} from the designated member (5, 10, or 50)")
-@app_commands.describe(member="Must be the designated member", amount="5, 10, or 50", reason="Optional reason")
+@bot.tree.command(description=f"Take {CURRENCY_NAME} from the designated member (multiples of {MULTIPLE_OF}, or {JACKPOT})")
+@app_commands.describe(member="Must be the designated member", amount=f"Multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or {JACKPOT}", reason="Optional reason")
 async def take(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
     if not is_authorized_actor(interaction.user.id):
         return await interaction.response.send_message(f"Only authorized users can take {CURRENCY_NAME}.", ephemeral=True)
     if member.id != TARGET_USER_ID:
         return await interaction.response.send_message(f"Only <@{TARGET_USER_ID}> can have {CURRENCY_NAME} taken away.", ephemeral=True)
-    if amount not in VALID_AMOUNTS:
-        return await interaction.response.send_message("Amount must be **5**, **10**, or **50**.", ephemeral=True)
+    # validate amount
+    if not (is_valid_multiple(amount) or amount == JACKPOT):
+        return await interaction.response.send_message(
+            f"Amount must be a positive multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or exactly {JACKPOT}.",
+            ephemeral=True
+        )
 
     await adjust_points(interaction.guild_id, member.id, -amount)
     await log_txn(interaction.guild_id, interaction.user.id, member.id, -amount, reason)
@@ -473,7 +483,7 @@ async def on_message(message: discord.Message):
     if message.guild and bot_mentioned and "remind" in low:
         note = extract_reminder_note(content)
         if note:
-            mentions_ids = [str(u.id) for u in message.mentions if u.id != bot.user.id]
+            mentions_ids = [str(u.id) for u in message.mentions if bot.user and u.id != bot.user.id]
             mentions_text = ", ".join(f"<@{uid}>" for uid in mentions_ids) if mentions_ids else ""
             try:
                 await save_reminder(
@@ -482,11 +492,10 @@ async def on_message(message: discord.Message):
                     channel_id=message.channel.id,
                     message_id=message.id,
                     mentions_text=mentions_text,
-                    note=note[:500]  # cap note length for sanity
+                    note=note[:500]
                 )
                 await message.channel.send(f"✅ Saved reminder to bank: _{note[:120]}{'…' if len(note)>120 else ''}_")
             except Exception:
-                # stay quiet on DB failure to avoid noise
                 pass
 
     await bot.process_commands(message)
