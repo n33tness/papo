@@ -31,8 +31,12 @@ GIVE_COOLDOWN_SECONDS = 8
 BONK_EMOJI = "<:bonk:1427717741481033799>"
 BONK_COOLDOWN_SECONDS = 3  # per-user cooldown
 BONK_STREAK_STEP = 10      # trigger memes at 10, 20, 30…
-BONK_PENALTY_STEP = 20     # every 20 bonks -> -5 noodles
+
+# penalties
+BONK_PENALTY_STEP = 20           # every 20 bonks -> -5 noodles
 BONK_PENALTY_AMOUNT = 5
+BONK_BIG_PENALTY_STEP = 100      # every 100 bonks -> -20 noodles (additional)
+BONK_BIG_PENALTY_AMOUNT = 20
 
 # Spotify detection (text + shorteners)
 SPOTIFY_REGEX = re.compile(
@@ -255,7 +259,6 @@ async def remove_bonks_for_user(guild_id: int, bonker_id: int, window: str, coun
     elif window == "week":
         where += " AND created_at >= (NOW() - INTERVAL '7 days')"
 
-    # Use a CTE to select newest N ids, then delete them and count how many were removed
     sql = f"""
     WITH to_del AS (
         SELECT id FROM smuckles_bonk_log
@@ -704,7 +707,7 @@ async def on_message(message: discord.Message):
                     ]
                     await message.channel.send(random.choice(memes))
 
-                # 💸 every 20 bonks deduct 5 noodles (and log it)
+                # 💸 every 20 bonks deduct 5 noodles
                 if count_today % BONK_PENALTY_STEP == 0:
                     await adjust_points(message.guild.id, TARGET_USER_ID, -BONK_PENALTY_AMOUNT)
                     actor_id = bot.user.id if bot.user else ADMIN_USER_ID
@@ -719,6 +722,24 @@ async def on_message(message: discord.Message):
                     await message.channel.send(
                         f"💀 {target_mention} has been bonked **{count_today}** times today and loses "
                         f"**{BONK_PENALTY_AMOUNT} {CURRENCY_EMOJI} {CURRENCY_NAME}**!\n"
+                        f"New total: **{total} {CURRENCY_EMOJI}**."
+                    )
+
+                # 💥 every 100 bonks deduct an additional 20 noodles
+                if count_today % BONK_BIG_PENALTY_STEP == 0:
+                    await adjust_points(message.guild.id, TARGET_USER_ID, -BONK_BIG_PENALTY_AMOUNT)
+                    actor_id = bot.user.id if bot.user else ADMIN_USER_ID
+                    await log_txn(
+                        guild_id=message.guild.id,
+                        actor_id=actor_id,
+                        target_id=TARGET_USER_ID,
+                        delta=-BONK_BIG_PENALTY_AMOUNT,
+                        reason=f"{BONK_BIG_PENALTY_STEP}-bonk penalty"
+                    )
+                    total = await get_points(message.guild.id, TARGET_USER_ID)
+                    await message.channel.send(
+                        f"☠️ {target_mention} hit **{count_today}** bonks today and loses an extra "
+                        f"**{BONK_BIG_PENALTY_AMOUNT} {CURRENCY_EMOJI} {CURRENCY_NAME}**!\n"
                         f"New total: **{total} {CURRENCY_EMOJI}**."
                     )
 
