@@ -241,6 +241,39 @@ async def bonk_leaderboard(guild_id: int, window: str, limit: int):
         rows = await con.fetch(sql, guild_id, TARGET_USER_ID, limit)
     return [(int(r["bonker_id"]), int(r["c"])) for r in rows]
 
+async def remove_bonks_for_user(guild_id: int, bonker_id: int, window: str, count: int) -> int:
+    """
+    Delete the most recent N bonks by bonker_id against TARGET within window.
+    window: 'all' | 'day' | 'week'
+    Returns number of rows deleted.
+    """
+    if count <= 0:
+        return 0
+    where = "guild_id=$1 AND target_id=$2 AND bonker_id=$3"
+    if window == "day":
+        where += " AND created_at::date = CURRENT_DATE"
+    elif window == "week":
+        where += " AND created_at >= (NOW() - INTERVAL '7 days')"
+
+    # Use a CTE to select newest N ids, then delete them and count how many were removed
+    sql = f"""
+    WITH to_del AS (
+        SELECT id FROM smuckles_bonk_log
+        WHERE {where}
+        ORDER BY created_at DESC
+        LIMIT $4
+    ),
+    del AS (
+        DELETE FROM smuckles_bonk_log
+        WHERE id IN (SELECT id FROM to_del)
+        RETURNING 1
+    )
+    SELECT COUNT(*) FROM del;
+    """
+    async with db_pool.acquire() as con:
+        n = await con.fetchval(sql, guild_id, TARGET_USER_ID, bonker_id, count)
+    return int(n or 0)
+
 # ========= HELPERS =========
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_USER_ID
@@ -346,7 +379,8 @@ async def papohelp(interaction: discord.Interaction):
         f"• Type `bonk` in chat to bonk {target} (3s personal cooldown).\n"
         "• Streak memes at 10, 20, 30… bonks per day.\n"
         "• `/bonkstats [member]` — bonks today/week/all-time.\n"
-        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n\n"
+        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n"
+        "• `/bonkremove member:<user> count:<n> window:<all|day|week>` — (admin) remove recent bonks from a user.\n\n"
 
         "### 🎵 Spotify Memory\n"
         f"• Auto-saves Spotify links from {target}.\n"
@@ -610,6 +644,26 @@ async def bonktop(interaction: discord.Interaction, limit: int = 10, window: str
     for i, (uid, c) in enumerate(rows, start=1):
         lines.append(f"{i}. <@{uid}> — **{c}**")
     await interaction.response.send_message("\n".join(lines))
+
+# ========= Admin: remove bonks for a user =========
+@bot.tree.command(name="bonkremove", description="Admin: remove recent bonks a member made against the target")
+@app_commands.describe(member="Member whose bonks to remove", count="How many recent bonks to remove", window="all | day | week")
+async def bonkremove(interaction: discord.Interaction, member: discord.Member, count: int, window: str = "all"):
+    if interaction.user.id != ADMIN_USER_ID:
+        return await interaction.response.send_message("Only the bot admin can remove bonks.", ephemeral=True)
+    window = window.lower().strip()
+    if window not in ("all", "day", "week"):
+        return await interaction.response.send_message("`window` must be one of: **all**, **day**, **week**.", ephemeral=True)
+    if count <= 0 or count > 1000:
+        return await interaction.response.send_message("`count` must be between 1 and 1000.", ephemeral=True)
+
+    removed = await remove_bonks_for_user(interaction.guild_id, member.id, window, count)
+    if removed == 0:
+        return await interaction.response.send_message(f"No matching bonks found to remove for {member.mention} in `{window}` window.", ephemeral=True)
+    await interaction.response.send_message(
+        f"🧽 Removed **{removed}** bonk{'s' if removed != 1 else ''} made by {member.mention} against <@{TARGET_USER_ID}> in `{window}` window.",
+        ephemeral=True
+    )
 
 # ========= BONK + SPOTIFY LIVE + REMINDER CAPTURE =========
 @bot.event
