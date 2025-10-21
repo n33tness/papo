@@ -5,12 +5,15 @@ import asyncio
 import asyncpg
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 # ========= CONFIG =========
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-guild sync
+ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))  # optional; where to post nuke messages
 
 # 🍜 Currency / theme
 CURRENCY_EMOJI = "🍉"               # your watermelon vibe
@@ -43,6 +46,14 @@ SPOTIFY_REGEX = re.compile(
     r'(https?://(?:open\.spotify\.com|spotify\.link|spoti\.fi)/[^\s>]+)',
     re.IGNORECASE
 )
+
+# Timezone for nuke counter
+NUKE_TZ = ZoneInfo("America/Chicago")
+NUKE_MONTH = 10   # October
+NUKE_DAY = 31
+NUKE_HOUR = 12    # 12:45 PM
+NUKE_MIN = 45
+NUKE_THRESHOLD = 100  # points required to avoid reset
 
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
@@ -111,6 +122,16 @@ CREATE TABLE IF NOT EXISTS smuckles_bonk_log (
 );
 """
 
+# Track whether we've run the nuke for a given guild & year/date
+CREATE_NUKE_STATE = """
+CREATE TABLE IF NOT EXISTS smuckles_nuke_state (
+  guild_id BIGINT NOT NULL,
+  deadline_date DATE NOT NULL,
+  executed_at TIMESTAMPTZ,
+  PRIMARY KEY (guild_id, deadline_date)
+);
+"""
+
 async def db_init():
     global db_pool
     if not DATABASE_URL:
@@ -122,6 +143,7 @@ async def db_init():
         await con.execute(CREATE_SPOTIFY)
         await con.execute(CREATE_REMINDERS)
         await con.execute(CREATE_BONK_LOG)
+        await con.execute(CREATE_NUKE_STATE)
 
 # ======== Golden Noodles ========
 async def adjust_points(guild_id: int, target_id: int, delta: int):
@@ -134,6 +156,18 @@ async def adjust_points(guild_id: int, target_id: int, delta: int):
             await con.execute(
                 "UPDATE smuckles_users SET points = points + $1 WHERE guild_id=$2 AND user_id=$3",
                 delta, guild_id, target_id,
+            )
+
+async def set_points(guild_id: int, target_id: int, new_total: int):
+    async with db_pool.acquire() as con:
+        async with con.transaction():
+            await con.execute(
+                "INSERT INTO smuckles_users (guild_id, user_id, points) VALUES ($1,$2,0) ON CONFLICT DO NOTHING",
+                guild_id, target_id,
+            )
+            await con.execute(
+                "UPDATE smuckles_users SET points = $1 WHERE guild_id=$2 AND user_id=$3",
+                new_total, guild_id, target_id
             )
 
 async def get_points(guild_id: int, user_id: int) -> int:
@@ -246,11 +280,6 @@ async def bonk_leaderboard(guild_id: int, window: str, limit: int):
     return [(int(r["bonker_id"]), int(r["c"])) for r in rows]
 
 async def remove_bonks_for_user(guild_id: int, bonker_id: int, window: str, count: int) -> int:
-    """
-    Delete the most recent N bonks by bonker_id against TARGET within window.
-    window: 'all' | 'day' | 'week'
-    Returns number of rows deleted.
-    """
     if count <= 0:
         return 0
     where = "guild_id=$1 AND target_id=$2 AND bonker_id=$3"
@@ -258,7 +287,6 @@ async def remove_bonks_for_user(guild_id: int, bonker_id: int, window: str, coun
         where += " AND created_at::date = CURRENT_DATE"
     elif window == "week":
         where += " AND created_at >= (NOW() - INTERVAL '7 days')"
-
     sql = f"""
     WITH to_del AS (
         SELECT id FROM smuckles_bonk_log
@@ -306,28 +334,20 @@ def bonk_on_cooldown(user_id: int) -> bool:
     return False
 
 def extract_spotify_from_message(msg: discord.Message) -> list[str]:
-    """Find spotify links in message content AND embeds."""
     urls = []
     urls += SPOTIFY_REGEX.findall(msg.content or "")
     for e in msg.embeds:
-        if e.url:
-            urls += SPOTIFY_REGEX.findall(e.url)
-        if e.description:
-            urls += SPOTIFY_REGEX.findall(e.description)
-        if e.title:
-            urls += SPOTIFY_REGEX.findall(e.title)
+        if e.url: urls += SPOTIFY_REGEX.findall(e.url)
+        if e.description: urls += SPOTIFY_REGEX.findall(e.description)
+        if e.title: urls += SPOTIFY_REGEX.findall(e.title)
         for f in (e.fields or []):
-            if f.name:
-                urls += SPOTIFY_REGEX.findall(f.name)
-            if f.value:
-                urls += SPOTIFY_REGEX.findall(f.value)
-    # dedupe preserving order
+            if f.name: urls += SPOTIFY_REGEX.findall(f.name)
+            if f.value: urls += SPOTIFY_REGEX.findall(f.value)
     seen = set()
     out = []
     for u in urls:
         if u not in seen:
-            seen.add(u)
-            out.append(u)
+            seen.add(u); out.append(u)
     return out
 
 def extract_reminder_note(raw_content: str) -> str | None:
@@ -341,7 +361,50 @@ def extract_reminder_note(raw_content: str) -> str | None:
     note = re.sub(r"^(me|us|to|@?\w+)?\s*", "", note, flags=re.IGNORECASE)
     return note if note else None
 
-# ========= READY =========
+def next_nuke_deadline(now_tz: datetime) -> datetime:
+    """Return the next Oct 31 12:45 PM America/Chicago at/after now."""
+    year = now_tz.year
+    candidate = datetime(year, NUKE_MONTH, NUKE_DAY, NUKE_HOUR, NUKE_MIN, tzinfo=NUKE_TZ)
+    if now_tz > candidate:
+        candidate = datetime(year + 1, NUKE_MONTH, NUKE_DAY, NUKE_HOUR, NUKE_MIN, tzinfo=NUKE_TZ)
+    return candidate
+
+async def already_executed(guild_id: int, deadline_date: date) -> bool:
+    async with db_pool.acquire() as con:
+        row = await con.fetchrow(
+            "SELECT executed_at FROM smuckles_nuke_state WHERE guild_id=$1 AND deadline_date=$2",
+            guild_id, deadline_date
+        )
+        return bool(row)
+
+async def mark_executed(guild_id: int, deadline_date: date):
+    async with db_pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO smuckles_nuke_state (guild_id, deadline_date, executed_at) VALUES ($1,$2,NOW()) "
+            "ON CONFLICT (guild_id, deadline_date) DO UPDATE SET executed_at = EXCLUDED.executed_at",
+            guild_id, deadline_date
+        )
+
+async def announce(guild: discord.Guild, msg: str):
+    channel = None
+    if ANNOUNCE_CHANNEL_ID:
+        channel = guild.get_channel(ANNOUNCE_CHANNEL_ID)
+    if not channel:
+        channel = guild.system_channel
+    if not channel:
+        # fallback: first text channel bot can send to
+        for c in guild.text_channels:
+            perms = c.permissions_for(guild.me)
+            if perms.send_messages:
+                channel = c
+                break
+    if channel:
+        try:
+            await channel.send(msg)
+        except Exception:
+            pass
+
+# ========= READY & TASKS =========
 @bot.event
 async def on_ready():
     await db_init()
@@ -353,6 +416,55 @@ async def on_ready():
     else:
         await bot.tree.sync()
         print(f"✅ Synced global commands as {bot.user}")
+
+    if not nuke_watch.is_running():
+        nuke_watch.start()
+        print("🧨 Nuke watcher started.")
+
+@tasks.loop(minutes=1)
+async def nuke_watch():
+    """Every minute: if it's at/after the deadline and not executed for that date, run the nuke check."""
+    now = datetime.now(tz=NUKE_TZ)
+    # Specific requirement: Oct 31 @ 12:45 PM America/Chicago each year
+    deadline = datetime(now.year, NUKE_MONTH, NUKE_DAY, NUKE_HOUR, NUKE_MIN, tzinfo=NUKE_TZ)
+    deadline_date = deadline.date()
+
+    # If we passed this year's deadline, we still allow same-day (late) catch-up for robustness
+    window_ok = (now >= deadline) and (now <= deadline + timedelta(days=1))
+
+    for guild in list(bot.guilds):
+        try:
+            if await already_executed(guild.id, deadline_date):
+                continue
+            if window_ok:
+                # Run the nuke check
+                total = await get_points(guild.id, TARGET_USER_ID)
+                if total < NUKE_THRESHOLD:
+                    # Set to 0 and log delta
+                    delta = -total
+                    await set_points(guild.id, TARGET_USER_ID, 0)
+                    actor_id = bot.user.id if bot.user else ADMIN_USER_ID
+                    await log_txn(
+                        guild_id=guild.id,
+                        actor_id=actor_id,
+                        target_id=TARGET_USER_ID,
+                        delta=delta,  # negative or zero
+                        reason=f"Nuke: below {NUKE_THRESHOLD} at Oct 31 12:45 PM CT"
+                    )
+                    await announce(
+                        guild,
+                        f"🧨 **NUKE TRIGGERED** — <@{TARGET_USER_ID}> had **{total} {CURRENCY_EMOJI} {CURRENCY_NAME}** "
+                        f"at the deadline. Balance has been reset to **0 {CURRENCY_EMOJI}**."
+                    )
+                else:
+                    await announce(
+                        guild,
+                        f"🛡️ **NUKE SAFE** — <@{TARGET_USER_ID}> had **{total} {CURRENCY_EMOJI} {CURRENCY_NAME}** "
+                        f"at the deadline. No reset."
+                    )
+                await mark_executed(guild.id, deadline_date)
+        except Exception as e:
+            print(f"Nuke watcher error in guild {guild.id}: {e}")
 
 # ========= /papoping =========
 @bot.tree.command(name="papoping", description="Check if the bot is alive and running")
@@ -382,8 +494,7 @@ async def papohelp(interaction: discord.Interaction):
         f"• Type `bonk` in chat to bonk {target} (3s personal cooldown).\n"
         "• Streak memes at 10, 20, 30… bonks per day.\n"
         "• `/bonkstats [member]` — bonks today/week/all-time.\n"
-        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n"
-        "• `/bonkremove member:<user> count:<n> window:<all|day|week>` — (admin) remove recent bonks from a user.\n\n"
+        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n\n"
 
         "### 🎵 Spotify Memory\n"
         f"• Auto-saves Spotify links from {target}.\n"
@@ -397,10 +508,39 @@ async def papohelp(interaction: discord.Interaction):
         "• `/remindbank [limit]` — (admin) view recent reminders.\n"
         "• `/clearemindbank` — (admin) wipe all reminders.\n\n"
 
+        "### 🧨 Nuke Counter\n"
+        "• Auto-check at **Oct 31, 12:45 PM (America/Chicago)**. If target < 100 noodles, balance resets to 0.\n"
+        "• `/nukestatus` — shows next deadline and current status.\n\n"
+
         "### 🧪 Utility\n"
         "• `/papoping` — latency test.\n"
     )
     await interaction.response.send_message(msg, ephemeral=True)
+
+# ========= /nukestatus =========
+@bot.tree.command(name="nukestatus", description="Show nuke deadline & whether the target is safe")
+async def nukestatus(interaction: discord.Interaction):
+    now_ct = datetime.now(tz=NUKE_TZ)
+    # Next deadline (if we’re past this year’s, it will show next year)
+    deadline = next_nuke_deadline(now_ct)
+    # This year’s “official” deadline (even if passed)
+    this_year_deadline = datetime(now_ct.year, NUKE_MONTH, NUKE_DAY, NUKE_HOUR, NUKE_MIN, tzinfo=NUKE_TZ)
+    executed = await already_executed(interaction.guild_id, this_year_deadline.date())
+    total = await get_points(interaction.guild_id, TARGET_USER_ID)
+    remaining = deadline - now_ct if deadline > now_ct else timedelta(0)
+
+    safe = total >= NUKE_THRESHOLD
+    status = "✅ SAFE" if safe else "⚠️ AT RISK"
+
+    lines = [
+        "### 🧨 Nuke Status",
+        f"**Target:** <@{TARGET_USER_ID}>",
+        f"**Current Balance:** {total} {CURRENCY_EMOJI} {CURRENCY_NAME} → **{status}** (needs ≥ {NUKE_THRESHOLD})",
+        f"**Next Deadline (CT):** {deadline.strftime('%Y-%m-%d %I:%M %p %Z')}",
+        f"**Time Remaining:** {str(remaining).split('.',1)[0]}",
+        f"**This-Year Executed:** {'Yes' if executed else 'No'}",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 # ========= /give =========
 @bot.tree.command(description=f"Give {CURRENCY_NAME} to the designated member (multiples of {MULTIPLE_OF}, jackpot {JACKPOT})")
@@ -744,10 +884,9 @@ async def on_message(message: discord.Message):
                     )
 
             except Exception as e:
-                # Keep bot resilient; just log to console
                 print("Bonk handling error:", e)
 
-    # --- SPOTIFY (live capture) — captures content + embeds from the target user
+    # --- SPOTIFY (live capture)
     if message.author.id == TARGET_USER_ID:
         urls = []
         urls += SPOTIFY_REGEX.findall(message.content or "")
@@ -758,7 +897,6 @@ async def on_message(message: discord.Message):
             for f in (e.fields or []):
                 if f.name: urls += SPOTIFY_REGEX.findall(f.name)
                 if f.value: urls += SPOTIFY_REGEX.findall(f.value)
-        # dedupe
         if urls:
             seen, unique = set(), []
             for u in urls:
@@ -803,5 +941,5 @@ async def on_message(message: discord.Message):
 
 # ========= RUN =========
 if not TOKEN:
-    raise SystemExit("❌ Missing DISCORD_TOKEN environment variable.")
+    raise SystemExit("❌ Missing DISCORD_TOKEN env var.")
 bot.run(TOKEN)
