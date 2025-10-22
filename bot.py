@@ -13,32 +13,31 @@ from zoneinfo import ZoneInfo
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-guild sync
-ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))  # optional; where to post nuke messages
+ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))  # optional; where to post nuke/announce messages
 
 # 🍜 Currency / theme
-CURRENCY_EMOJI = "🍉"               # your watermelon vibe
-CURRENCY_NAME  = "golden noodles"   # renamed from "smuckles"
+CURRENCY_EMOJI = "🍉"
+CURRENCY_NAME  = "golden noodles"
 
-# 🔒 IDs (edit if they change)
-TARGET_USER_ID = 1028310674318839878         # the only user who can gain/lose golden noodles + Spotify tracking
-AUTHORIZED_GIVER_ID = 1422010902680567918    # primary authorized user for /give and /take
-ADMIN_USER_ID = 939225086341296209           # admin override (also allowed to /give, /take, scans, remindbank)
+# 🔒 IDs
+TARGET_USER_ID = 1028310674318839878         # user whose noodles/bonks/spotify/names we track
+AUTHORIZED_GIVER_ID = 1422010902680567918    # can /give, /take
+ADMIN_USER_ID = 939225086341296209           # full admin override
 
 # Golden noodles settings
-MULTIPLE_OF = 5          # any positive multiple of 5 is allowed
-JACKPOT = 100            # special jackpot amount
+MULTIPLE_OF = 5
+JACKPOT = 100
 LEADERBOARD_LIMIT_DEFAULT = 10
 GIVE_COOLDOWN_SECONDS = 8
 
 # Bonk settings
 BONK_EMOJI = "<:bonk:1427717741481033799>"
-BONK_COOLDOWN_SECONDS = 3  # per-user cooldown
-BONK_STREAK_STEP = 10      # trigger memes at 10, 20, 30…
-
+BONK_COOLDOWN_SECONDS = 3
+BONK_STREAK_STEP = 10
 # penalties
-BONK_PENALTY_STEP = 20           # every 20 bonks -> -5 noodles
+BONK_PENALTY_STEP = 20           # every 20 bonks -> -5
 BONK_PENALTY_AMOUNT = 5
-BONK_BIG_PENALTY_STEP = 100      # every 100 bonks -> -20 noodles (additional)
+BONK_BIG_PENALTY_STEP = 100      # every 100 bonks -> -20 (additional)
 BONK_BIG_PENALTY_AMOUNT = 20
 
 # Spotify detection (text + shorteners)
@@ -47,17 +46,18 @@ SPOTIFY_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# Timezone for nuke counter
+# Nuke counter (Oct 31, 12:45pm America/Chicago)
 NUKE_TZ = ZoneInfo("America/Chicago")
-NUKE_MONTH = 10   # October
+NUKE_MONTH = 10
 NUKE_DAY = 31
-NUKE_HOUR = 12    # 12:45 PM
+NUKE_HOUR = 12
 NUKE_MIN = 45
-NUKE_THRESHOLD = 100  # points required to avoid reset
+NUKE_THRESHOLD = 100  # must be >= to be safe
 
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
-intents.message_content = True  # Needed for bonk + Spotify capture + backfill + reminder capture
+intents.message_content = True  # capture bonk/spotify/remind
+intents.members = True          # REQUIRED for nickname change tracking (and member cache)
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
@@ -122,13 +122,25 @@ CREATE TABLE IF NOT EXISTS smuckles_bonk_log (
 );
 """
 
-# Track whether we've run the nuke for a given guild & year/date
 CREATE_NUKE_STATE = """
 CREATE TABLE IF NOT EXISTS smuckles_nuke_state (
   guild_id BIGINT NOT NULL,
   deadline_date DATE NOT NULL,
   executed_at TIMESTAMPTZ,
   PRIMARY KEY (guild_id, deadline_date)
+);
+"""
+
+# 🆕 Name-change history
+CREATE_NAME_HISTORY = """
+CREATE TABLE IF NOT EXISTS smuckles_name_history (
+  id         BIGSERIAL PRIMARY KEY,
+  guild_id   BIGINT NOT NULL,
+  user_id    BIGINT NOT NULL,
+  kind       TEXT NOT NULL,       -- 'nick' or 'username'
+  old_name   TEXT NOT NULL,
+  new_name   TEXT NOT NULL,
+  changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
@@ -144,6 +156,7 @@ async def db_init():
         await con.execute(CREATE_REMINDERS)
         await con.execute(CREATE_BONK_LOG)
         await con.execute(CREATE_NUKE_STATE)
+        await con.execute(CREATE_NAME_HISTORY)
 
 # ======== Golden Noodles ========
 async def adjust_points(guild_id: int, target_id: int, delta: int):
@@ -241,7 +254,6 @@ async def today_bonk_count(guild_id: int) -> int:
         )
 
 async def bonk_counts_for_user(guild_id: int, bonker_id: int) -> tuple[int, int, int]:
-    """Return (today, week, all_time) for a given bonker vs the TARGET."""
     async with db_pool.acquire() as con:
         today = await con.fetchval(
             "SELECT COUNT(*) FROM smuckles_bonk_log "
@@ -261,7 +273,6 @@ async def bonk_counts_for_user(guild_id: int, bonker_id: int) -> tuple[int, int,
     return int(today or 0), int(week or 0), int(all_time or 0)
 
 async def bonk_leaderboard(guild_id: int, window: str, limit: int):
-    """Return list[(bonker_id, count)] ordered desc for 'all'|'day'|'week'."""
     where = "guild_id=$1 AND target_id=$2"
     if window == "day":
         where += " AND created_at::date = CURRENT_DATE"
@@ -304,6 +315,28 @@ async def remove_bonks_for_user(guild_id: int, bonker_id: int, window: str, coun
     async with db_pool.acquire() as con:
         n = await con.fetchval(sql, guild_id, TARGET_USER_ID, bonker_id, count)
     return int(n or 0)
+
+# ======== Name History ========
+async def save_name_change(guild_id: int, user_id: int, kind: str, old_name: str, new_name: str):
+    if not old_name or not new_name or old_name == new_name:
+        return
+    async with db_pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO smuckles_name_history (guild_id, user_id, kind, old_name, new_name) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            guild_id, user_id, kind, old_name, new_name
+        )
+
+async def fetch_name_history(guild_id: int, user_id: int, limit: int = 25):
+    async with db_pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT kind, old_name, new_name, changed_at "
+            "FROM smuckles_name_history "
+            "WHERE guild_id=$1 AND user_id=$2 "
+            "ORDER BY changed_at DESC LIMIT $3",
+            guild_id, user_id, limit
+        )
+    return rows
 
 # ========= HELPERS =========
 def is_admin(user_id: int) -> bool:
@@ -362,7 +395,6 @@ def extract_reminder_note(raw_content: str) -> str | None:
     return note if note else None
 
 def next_nuke_deadline(now_tz: datetime) -> datetime:
-    """Return the next Oct 31 12:45 PM America/Chicago at/after now."""
     year = now_tz.year
     candidate = datetime(year, NUKE_MONTH, NUKE_DAY, NUKE_HOUR, NUKE_MIN, tzinfo=NUKE_TZ)
     if now_tz > candidate:
@@ -392,7 +424,6 @@ async def announce(guild: discord.Guild, msg: str):
     if not channel:
         channel = guild.system_channel
     if not channel:
-        # fallback: first text channel bot can send to
         for c in guild.text_channels:
             perms = c.permissions_for(guild.me)
             if perms.send_messages:
@@ -423,13 +454,9 @@ async def on_ready():
 
 @tasks.loop(minutes=1)
 async def nuke_watch():
-    """Every minute: if it's at/after the deadline and not executed for that date, run the nuke check."""
     now = datetime.now(tz=NUKE_TZ)
-    # Specific requirement: Oct 31 @ 12:45 PM America/Chicago each year
     deadline = datetime(now.year, NUKE_MONTH, NUKE_DAY, NUKE_HOUR, NUKE_MIN, tzinfo=NUKE_TZ)
     deadline_date = deadline.date()
-
-    # If we passed this year's deadline, we still allow same-day (late) catch-up for robustness
     window_ok = (now >= deadline) and (now <= deadline + timedelta(days=1))
 
     for guild in list(bot.guilds):
@@ -437,10 +464,8 @@ async def nuke_watch():
             if await already_executed(guild.id, deadline_date):
                 continue
             if window_ok:
-                # Run the nuke check
                 total = await get_points(guild.id, TARGET_USER_ID)
                 if total < NUKE_THRESHOLD:
-                    # Set to 0 and log delta
                     delta = -total
                     await set_points(guild.id, TARGET_USER_ID, 0)
                     actor_id = bot.user.id if bot.user else ADMIN_USER_ID
@@ -448,7 +473,7 @@ async def nuke_watch():
                         guild_id=guild.id,
                         actor_id=actor_id,
                         target_id=TARGET_USER_ID,
-                        delta=delta,  # negative or zero
+                        delta=delta,
                         reason=f"Nuke: below {NUKE_THRESHOLD} at Oct 31 12:45 PM CT"
                     )
                     await announce(
@@ -466,7 +491,37 @@ async def nuke_watch():
         except Exception as e:
             print(f"Nuke watcher error in guild {guild.id}: {e}")
 
-# ========= /papoping =========
+# ========= NAME CHANGE TRACKING =========
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Track server NICKNAME changes for the target user
+    if after.id != TARGET_USER_ID:
+        return
+    # before.nick can be None, same for after.nick
+    if before.nick != after.nick:
+        old = before.nick or before.name
+        new = after.nick or after.name
+        try:
+            await save_name_change(after.guild.id, after.id, "nick", old, new)
+        except Exception as e:
+            print("Name history (nick) save error:", e)
+
+@bot.event
+async def on_user_update(before: discord.User, after: discord.User):
+    # Track GLOBAL USERNAME changes for the target user
+    if after.id != TARGET_USER_ID:
+        return
+    if before.name != after.name:
+        # Save for all guilds the bot shares with the user (so history appears in that server too)
+        for guild in bot.guilds:
+            member = guild.get_member(after.id)
+            if member:
+                try:
+                    await save_name_change(guild.id, after.id, "username", before.name, after.name)
+                except Exception as e:
+                    print("Name history (username) save error:", e)
+
+# ========= /paponing =========
 @bot.tree.command(name="papoping", description="Check if the bot is alive and running")
 async def papoping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
@@ -492,12 +547,17 @@ async def papohelp(interaction: discord.Interaction):
 
         "### 🔨 Bonks\n"
         f"• Type `bonk` in chat to bonk {target} (3s personal cooldown).\n"
-        "• Streak memes at 10, 20, 30… bonks per day.\n"
+        "• Streak memes at 10, 20, 30… bonks per day (+ penalties at 20 & 100).\n"
         "• `/bonkstats [member]` — bonks today/week/all-time.\n"
-        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n\n"
+        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n"
+        "• `/bonkremove member:<user> count:<n> window:<all|day|week>` — (admin) remove recent bonks from a user.\n\n"
+
+        "### 🧨 Nuke Counter\n"
+        "• Auto-check at **Oct 31, 12:45 PM (America/Chicago)**. If target < 100 noodles, balance resets to 0.\n"
+        "• `/nukestatus` — shows next deadline and current status.\n\n"
 
         "### 🎵 Spotify Memory\n"
-        f"• Auto-saves Spotify links from {target}.\n"
+        "• Auto-saves Spotify links from target.\n"
         "• `/papolinks [limit]` — recent Spotify links.\n"
         "• `/paposcan channel:[#channel] [limit]` — (admin) backfill scan.\n\n"
 
@@ -508,9 +568,9 @@ async def papohelp(interaction: discord.Interaction):
         "• `/remindbank [limit]` — (admin) view recent reminders.\n"
         "• `/clearemindbank` — (admin) wipe all reminders.\n\n"
 
-        "### 🧨 Nuke Counter\n"
-        "• Auto-check at **Oct 31, 12:45 PM (America/Chicago)**. If target < 100 noodles, balance resets to 0.\n"
-        "• `/nukestatus` — shows next deadline and current status.\n\n"
+        "### 🏷️ Name History\n"
+        "• Tracks target’s **nickname** (server) & **username** (global) changes.\n"
+        "• `/paponames [limit]` — show recent name changes.\n\n"
 
         "### 🧪 Utility\n"
         "• `/papoping` — latency test.\n"
@@ -521,9 +581,7 @@ async def papohelp(interaction: discord.Interaction):
 @bot.tree.command(name="nukestatus", description="Show nuke deadline & whether the target is safe")
 async def nukestatus(interaction: discord.Interaction):
     now_ct = datetime.now(tz=NUKE_TZ)
-    # Next deadline (if we’re past this year’s, it will show next year)
     deadline = next_nuke_deadline(now_ct)
-    # This year’s “official” deadline (even if passed)
     this_year_deadline = datetime(now_ct.year, NUKE_MONTH, NUKE_DAY, NUKE_HOUR, NUKE_MIN, tzinfo=NUKE_TZ)
     executed = await already_executed(interaction.guild_id, this_year_deadline.date())
     total = await get_points(interaction.guild_id, TARGET_USER_ID)
@@ -541,6 +599,30 @@ async def nukestatus(interaction: discord.Interaction):
         f"**This-Year Executed:** {'Yes' if executed else 'No'}",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+# ========= /paponames =========
+@bot.tree.command(name="paponames", description="Show recent nickname/username changes for the target")
+@app_commands.describe(limit="How many changes to show (default 25, max 100)")
+async def paponames(interaction: discord.Interaction, limit: int = 25):
+    limit = max(1, min(100, limit))
+    rows = await fetch_name_history(interaction.guild_id, TARGET_USER_ID, limit)
+    if not rows:
+        return await interaction.response.send_message("No name changes logged yet for the target.", ephemeral=True)
+
+    lines = [f"🏷️ **Name History for <@{TARGET_USER_ID}>** (showing {len(rows)})"]
+    for r in rows:
+        kind = r["kind"]
+        oldn = r["old_name"]
+        newn = r["new_name"]
+        ts   = r["changed_at"]
+        # nicely format timestamp in server’s local notion; here we print ISO short
+        when = ts.strftime("%Y-%m-%d %H:%M")
+        label = "Nickname" if kind == "nick" else "Username"
+        lines.append(f"• **{label}** — `{oldn}` → `{newn}` _({when})_")
+    msg = "\n".join(lines)
+    if len(msg) > 1900:
+        msg = "\n".join(lines[:30] + ["… (trimmed)"])
+    await interaction.response.send_message(msg)
 
 # ========= /give =========
 @bot.tree.command(description=f"Give {CURRENCY_NAME} to the designated member (multiples of {MULTIPLE_OF}, jackpot {JACKPOT})")
@@ -648,7 +730,7 @@ async def papolinks(interaction: discord.Interaction, limit: int = 10):
         msg = "\n".join(lines)
     await interaction.response.send_message(msg)
 
-# ========= /paposcan (admin-only backfill of Spotify links) =========
+# ========= /paposcan (admin) =========
 @bot.tree.command(name="paposcan", description="Admin: scan a channel's history to backfill the target's Spotify links")
 @app_commands.describe(
     channel="Text channel to scan",
@@ -703,7 +785,7 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
         ephemeral=True
     )
 
-# ========= Reminder bank commands =========
+# ========= Reminder bank =========
 @bot.tree.command(name="remindbank", description="Admin: list recent stored reminder requests")
 @app_commands.describe(limit="How many to show (default 10, max 50)")
 async def remindbank(interaction: discord.Interaction, limit: int = 10):
@@ -788,7 +870,7 @@ async def bonktop(interaction: discord.Interaction, limit: int = 10, window: str
         lines.append(f"{i}. <@{uid}> — **{c}**")
     await interaction.response.send_message("\n".join(lines))
 
-# ========= Admin: remove bonks for a user =========
+# ========= Admin: remove bonks =========
 @bot.tree.command(name="bonkremove", description="Admin: remove recent bonks a member made against the target")
 @app_commands.describe(member="Member whose bonks to remove", count="How many recent bonks to remove", window="all | day | week")
 async def bonkremove(interaction: discord.Interaction, member: discord.Member, count: int, window: str = "all"):
@@ -826,7 +908,6 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-            # Log bonk + check streaks and penalties
             try:
                 await log_bonk(
                     guild_id=message.guild.id,
@@ -836,7 +917,6 @@ async def on_message(message: discord.Message):
                 )
                 count_today = await today_bonk_count(message.guild.id)
 
-                # 🎭 meme milestones at 10, 20, 30...
                 if count_today % BONK_STREAK_STEP == 0:
                     memes = [
                         "💀 Papo has been bonked into another dimension.",
@@ -847,7 +927,6 @@ async def on_message(message: discord.Message):
                     ]
                     await message.channel.send(random.choice(memes))
 
-                # 💸 every 20 bonks deduct 5 noodles
                 if count_today % BONK_PENALTY_STEP == 0:
                     await adjust_points(message.guild.id, TARGET_USER_ID, -BONK_PENALTY_AMOUNT)
                     actor_id = bot.user.id if bot.user else ADMIN_USER_ID
@@ -865,7 +944,6 @@ async def on_message(message: discord.Message):
                         f"New total: **{total} {CURRENCY_EMOJI}**."
                     )
 
-                # 💥 every 100 bonks deduct an additional 20 noodles
                 if count_today % BONK_BIG_PENALTY_STEP == 0:
                     await adjust_points(message.guild.id, TARGET_USER_ID, -BONK_BIG_PENALTY_AMOUNT)
                     actor_id = bot.user.id if bot.user else ADMIN_USER_ID
@@ -882,38 +960,25 @@ async def on_message(message: discord.Message):
                         f"**{BONK_BIG_PENALTY_AMOUNT} {CURRENCY_EMOJI} {CURRENCY_NAME}**!\n"
                         f"New total: **{total} {CURRENCY_EMOJI}**."
                     )
-
             except Exception as e:
                 print("Bonk handling error:", e)
 
-    # --- SPOTIFY (live capture)
+    # --- SPOTIFY capture from target ---
     if message.author.id == TARGET_USER_ID:
-        urls = []
-        urls += SPOTIFY_REGEX.findall(message.content or "")
-        for e in message.embeds:
-            if e.url: urls += SPOTIFY_REGEX.findall(e.url)
-            if e.description: urls += SPOTIFY_REGEX.findall(e.description)
-            if e.title: urls += SPOTIFY_REGEX.findall(e.title)
-            for f in (e.fields or []):
-                if f.name: urls += SPOTIFY_REGEX.findall(f.name)
-                if f.value: urls += SPOTIFY_REGEX.findall(f.value)
+        urls = extract_spotify_from_message(message)
         if urls:
-            seen, unique = set(), []
-            for u in urls:
-                if u not in seen:
-                    seen.add(u); unique.append(u)
             try:
                 await save_spotify_links(
                     guild_id=message.guild.id if message.guild else 0,
                     user_id=message.author.id,
                     channel_id=message.channel.id,
                     message_id=message.id,
-                    urls=unique
+                    urls=urls
                 )
             except Exception:
                 pass
 
-    # --- REMINDER BANK: if the bot is mentioned + the word "remind" appears
+    # --- REMINDER capture ---
     try:
         bot_mentioned = any(user.id == bot.user.id for user in message.mentions) if bot.user else False
     except Exception:
