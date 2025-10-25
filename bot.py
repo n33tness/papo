@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 # ========= CONFIG =========
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-guild sync
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for per-guild sync (optional)
 ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))  # optional; where to post announce messages
 
 # 🍜 Currency / theme
@@ -24,7 +24,7 @@ TARGET_USER_ID = 1028310674318839878         # user whose noodles/bonks/spotify/
 AUTHORIZED_GIVER_ID = 1422010902680567918    # can /give, /take
 ADMIN_USER_ID = 939225086341296209           # full admin override
 
-# Sancho link-bank writers (both can add links)
+# Sancho link-bank writers (both can add/delete links)
 SANCHO_ALLOWED = {661077262468382761, 939225086341296209}
 
 # Golden noodles settings
@@ -67,6 +67,11 @@ intents.members = True          # REQUIRED for nickname change tracking
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
+
+# ========= RUNTIME CACHES =========
+# Stores the last numbered list that a user saw in /sancholinks so /sanchodelete num:N can resolve to an ID.
+# Key: (guild_id, viewer_user_id) -> list[int] (ordered Sancho row IDs)
+SANCHO_INDEX_CACHE: dict[tuple[int, int], list[int]] = {}
 
 # ========= DATABASE =========
 CREATE_USERS = """
@@ -585,61 +590,42 @@ async def on_user_update(before: discord.User, after: discord.User):
                 except Exception as e:
                     print("Name history (username) save error:", e)
 
-# ========= /papoping =========
+# ========= BASIC COMMANDS =========
 @bot.tree.command(name="papoping", description="Check if the bot is alive and running")
 async def papoping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"{CURRENCY_EMOJI} Papo is online! Ping: `{latency}ms`")
 
-# ========= /papohelp =========
 @bot.tree.command(name="papohelp", description="Show everything Papo can do")
 async def papohelp(interaction: discord.Interaction):
     target = f"<@{TARGET_USER_ID}>"
     giver  = f"<@{AUTHORIZED_GIVER_ID}>"
     admin  = f"<@{ADMIN_USER_ID}>"
-
     msg = (
         "## 🤖 Papo Command Guide\n"
         f"**Target:** {target}\n"
         f"**Giver:** {giver}\n"
         f"**Admin:** {admin}\n\n"
-
         "### 🍜 Golden Noodles\n"
-        f"• `/give @member amount reason` — (giver/admin) multiples of 5, or 100 for JACKPOT. Only {target} can receive.\n"
+        f"• `/give @member amount reason` — (giver/admin) multiples of 5, or 100 JACKPOT. Only {target} can receive.\n"
         f"• `/take @member amount reason` — (giver/admin) multiples of 5, or 100. Only affects {target}.\n"
         "• `/sandia [limit]` — leaderboard of golden noodles.\n\n"
-
         "### 🔨 Bonks\n"
-        f"• Type `bonk` in chat to bonk {target} (3s personal cooldown).\n"
-        "• Streak memes at 10, 20, 30… (+ penalties at 20 & 100).\n"
-        "• `/bonkstats [member]` — bonks today/week/all-time.\n"
-        "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n"
-        "• `/bonkremove member:<user> count:<n> window:<all|day|week>` — (admin) remove recent bonks.\n\n"
-
+        f"• Type `bonk` in chat to bonk {target} (3s cooldown).\n"
+        "• Streak memes at 10/20/30… (+ penalties at 20 & 100).\n"
+        "• `/bonkstats [member]`, `/bonktop [limit] [window]`, `/bonkremove …` (admin).\n\n"
         "### 🧨 Nuke Counter\n"
-        "• Auto-check at **Oct 31, 12:45 PM (America/Chicago)**. If target < 100 noodles, balance resets to 0.\n"
-        "• `/nukestatus` — shows next deadline and current status.\n\n"
-
+        "• Auto-check at **Oct 31, 12:45 PM (America/Chicago)** (needs ≥100 to be safe). `/nukestatus`.\n\n"
         "### 🎵 Spotify Memory\n"
-        "• Auto-saves Spotify links from target.\n"
-        "• `/papolinks [limit]` — recent Spotify links.\n"
-        "• `/paposcan channel:[#channel] [limit]` — (admin) backfill scan.\n\n"
-
+        "• Auto-saves Spotify links from target. `/papolinks`, `/paposcan` (admin).\n\n"
         "### 🗒️ Reminder Bank\n"
-        "• Mention the bot + say **remind ...** to save a reminder.\n"
-        "• `/myreminders [limit]`, `/clearmyreminders`, `/remindbank`, `/clearemindbank`.\n\n"
-
+        "• Mention bot + say **remind ...**. `/myreminders`, `/remindbank` (admin), `/clearemindbank` (admin).\n\n"
         "### 🏷️ Name History\n"
-        "• Tracks target’s **nickname** & **username** changes.\n"
-        "• `/paponames [limit]` — show recent name changes.\n\n"
-
+        "• `/paponames [limit]` — nickname/username changes.\n\n"
         "### 🔗 Sancho Link Bank\n"
-        "• `/sancho url:<link> [note:<text>]` — (allowed users only) save a link.\n"
-        "• `/sancholinks [limit] [mine] [author] [show_ids]` — list saved links.\n"
-        "• `/sanchodelete [id] [last]` — delete by ID, or your latest if `last:true`.\n\n"
-
-        "### 🧪 Utility\n"
-        "• `/papoping` — latency test.\n"
+        "• `/sancho url:<link> [note:<text>]` — save (allowed users).\n"
+        "• `/sancholinks [limit] [mine] [author] [show_ids] [numbered]` — list links.\n"
+        "• `/sanchodelete [id] [last] [num]` — delete by **ID**, **last**, or the **number** from your last numbered list.\n"
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -652,10 +638,8 @@ async def nukestatus(interaction: discord.Interaction):
     executed = await already_executed(interaction.guild_id, this_year_deadline.date())
     total = await get_points(interaction.guild_id, TARGET_USER_ID)
     remaining = deadline - now_ct if deadline > now_ct else timedelta(0)
-
     safe = total >= NUKE_THRESHOLD
     status = "✅ SAFE" if safe else "⚠️ AT RISK"
-
     lines = [
         "### 🧨 Nuke Status",
         f"**Target:** <@{TARGET_USER_ID}>",
@@ -674,7 +658,6 @@ async def paponames(interaction: discord.Interaction, limit: int = 25):
     rows = await fetch_name_history(interaction.guild_id, TARGET_USER_ID, limit)
     if not rows:
         return await interaction.response.send_message("No name changes logged yet for the target.", ephemeral=True)
-
     lines = [f"🏷️ **Name History for <@{TARGET_USER_ID}>** (showing {len(rows)})"]
     for r in rows:
         kind = r["kind"]
@@ -689,7 +672,7 @@ async def paponames(interaction: discord.Interaction, limit: int = 25):
         msg = "\n".join(lines[:30] + ["… (trimmed)"])
     await interaction.response.send_message(msg)
 
-# ========= /give =========
+# ========= Give / Take =========
 @bot.tree.command(description=f"Give {CURRENCY_NAME} to the designated member (multiples of {MULTIPLE_OF}, jackpot {JACKPOT})")
 @app_commands.describe(member="Must be the designated member", amount=f"Multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or {JACKPOT}", reason="Optional reason")
 async def give(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
@@ -717,7 +700,6 @@ async def give(interaction: discord.Interaction, member: discord.Member, amount:
             text += f" (_{reason}_)"
     await interaction.response.send_message(text)
 
-# ========= /take =========
 @bot.tree.command(description=f"Take {CURRENCY_NAME} from the designated member (multiples of {MULTIPLE_OF}, or {JACKPOT})")
 @app_commands.describe(member="Must be the designated member", amount=f"Multiple of {MULTIPLE_OF} (e.g., 5,10,15,...) or {JACKPOT}", reason="Optional reason")
 async def take(interaction: discord.Interaction, member: discord.Member, amount: int, reason: str | None = None):
@@ -764,7 +746,7 @@ async def sandia(interaction: discord.Interaction, limit: int = LEADERBOARD_LIMI
         lines.append(f"{i}. **{name}** — {pts} {CURRENCY_EMOJI}")
     await interaction.response.send_message("🏆 **Sandia Leaderboard**\n" + "\n".join(lines))
 
-# ========= /papolinks (Spotify link history) =========
+# ========= /papolinks (Spotify) =========
 @bot.tree.command(name="papolinks", description="Recent Spotify links posted by the target user")
 @app_commands.describe(limit="How many to show (default 10, max 50)")
 async def papolinks(interaction: discord.Interaction, limit: int = 10):
@@ -780,42 +762,28 @@ async def papolinks(interaction: discord.Interaction, limit: int = 10):
             "SELECT COUNT(*) FROM smuckles_spotify_links WHERE guild_id=$1 AND user_id=$2",
             interaction.guild_id, TARGET_USER_ID
         )
-
     if not rows:
         return await interaction.response.send_message("No Spotify links found yet.", ephemeral=False)
-
     lines = [f"🎵 **Spotify history for <@{TARGET_USER_ID}>** (showing {len(rows)}/{total_count}):"]
     for r in rows:
-        url = r["url"]
-        lines.append(f"• {url}")
+        lines.append(f"• {r['url']}")
     msg = "\n".join(lines)
     if len(msg) > 1800 and len(rows) > 20:
-        lines = lines[:21]
-        lines.append("… (trimmed)")
-        msg = "\n".join(lines)
+        msg = "\n".join(lines[:21] + ["… (trimmed)"])
     await interaction.response.send_message(msg)
 
-# ========= /paposcan (admin-only backfill of Spotify links) =========
+# ========= /paposcan (admin) =========
 @bot.tree.command(name="paposcan", description="Admin: scan a channel's history to backfill the target's Spotify links")
-@app_commands.describe(
-    channel="Text channel to scan",
-    limit="Max messages to scan (50–5000, default 1000, newest first)"
-)
+@app_commands.describe(channel="Text channel to scan", limit="Max messages to scan (50–5000, default 1000, newest first)")
 async def paposcan(interaction: discord.Interaction, channel: discord.TextChannel, limit: int = 1000):
     if interaction.user.id != ADMIN_USER_ID:
         return await interaction.response.send_message("Only the bot admin can run this.", ephemeral=True)
-
     limit = max(50, min(5000, limit))
     perms = channel.permissions_for(interaction.guild.me)
     if not (perms.read_messages and perms.read_message_history):
         return await interaction.response.send_message("I need **Read Messages** and **Read Message History** in that channel.", ephemeral=True)
-
     await interaction.response.defer(thinking=True, ephemeral=True)
-
-    scanned = 0
-    matched_msgs = 0
-    saved_urls = 0
-
+    scanned = matched_msgs = saved_urls = 0
     try:
         async for msg in channel.history(limit=limit, oldest_first=False):
             scanned += 1
@@ -823,25 +791,16 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
                 urls = extract_spotify_from_message(msg)
                 if urls:
                     matched_msgs += 1
-                    await save_spotify_links(
-                        guild_id=interaction.guild_id,
-                        user_id=TARGET_USER_ID,
-                        channel_id=channel.id,
-                        message_id=msg.id,
-                        urls=urls
-                    )
+                    await save_spotify_links(interaction.guild_id, TARGET_USER_ID, channel.id, msg.id, urls)
                     saved_urls += len(urls)
-
             if scanned % 200 == 0:
                 await asyncio.sleep(0.3)
-
     except discord.Forbidden:
         return await interaction.followup.send("I don't have permission to read that channel’s history.", ephemeral=True)
     except discord.HTTPException as e:
         return await interaction.followup.send(f"HTTP error while scanning: {e}", ephemeral=True)
     except Exception as e:
         return await interaction.followup.send(f"Unexpected error: {e}", ephemeral=True)
-
     await interaction.followup.send(
         f"✅ Scan complete for {channel.mention}\n"
         f"- Messages scanned: **{scanned}** (newest → oldest)\n"
@@ -850,7 +809,7 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
         ephemeral=True
     )
 
-# ========= Reminder bank commands =========
+# ========= Reminder bank =========
 @bot.tree.command(name="remindbank", description="Admin: list recent stored reminder requests")
 @app_commands.describe(limit="How many to show (default 10, max 50)")
 async def remindbank(interaction: discord.Interaction, limit: int = 10):
@@ -947,17 +906,26 @@ async def sancho(interaction: discord.Interaction, url: str, note: str | None = 
     pretty_note = f" — _{note.strip()}_" if note and note.strip() else ""
     await interaction.response.send_message(f"✅ Saved to Sancho: {url}{pretty_note}")
 
-@bot.tree.command(name="sancholinks", description="Show saved Sancho links (optionally filter to yours or a specific author)")
+@bot.tree.command(name="sancholinks", description="Show saved Sancho links (filterable; can show IDs or 1..N numbering)")
 @app_commands.describe(
     limit="How many to show (default 10, max 50)",
     mine="Show only links you added (default false)",
     author="Filter to a specific author (overrides mine if set)",
-    show_ids="Show internal IDs so you can delete or edit specific entries"
+    show_ids="Show database IDs so you can delete/edit specific entries",
+    numbered="Show list as 1..N and cache it so you can delete by number"
 )
-async def sancholinks(interaction: discord.Interaction, limit: int = 10, mine: bool = False, author: discord.Member | None = None, show_ids: bool = False):
+async def sancholinks(
+    interaction: discord.Interaction,
+    limit: int = 10,
+    mine: bool = False,
+    author: discord.Member | None = None,
+    show_ids: bool = False,
+    numbered: bool = False
+):
     limit = max(1, min(50, limit))
     author_id = author.id if author else (interaction.user.id if mine else None)
-    rows = await sancho_list(interaction.guild_id, limit=limit, author_id=author_id, with_ids=show_ids)
+
+    rows = await sancho_list(interaction.guild_id, limit=limit, author_id=author_id, with_ids=(show_ids or numbered))
     if not rows:
         return await interaction.response.send_message("No Sancho links found for that filter.", ephemeral=False)
 
@@ -967,50 +935,79 @@ async def sancholinks(interaction: discord.Interaction, limit: int = 10, mine: b
     header += f" (showing {len(rows)})"
 
     lines = [header]
-    for r in rows:
-        rid  = int(r["id"]) if show_ids else None
+    id_order: list[int] = []
+    for idx, r in enumerate(rows, start=1):
+        rid  = int(r["id"]) if (show_ids or numbered) else None
         who  = int(r["author_id"])
         url  = r["url"]
         note = r["note"]
         when = r["created_at"].strftime("%Y-%m-%d %H:%M")
-        id_prefix = f"`#{rid}` • " if show_ids else ""
+
+        id_prefix = ""
+        if show_ids:
+            id_prefix = f"`#{rid}` • "
+        if numbered:
+            id_prefix = f"**{idx}.** " + id_prefix
+            id_order.append(rid)
+
         tail = f" — _{note}_" if note else ""
         lines.append(f"• {id_prefix}{url}{tail}  _(by <@{who}> • {when})_")
+
+    # If we showed a numbered list, cache the order for the viewer
+    if numbered:
+        SANCHO_INDEX_CACHE[(interaction.guild_id, interaction.user.id)] = id_order
 
     msg = "\n".join(lines)
     if len(msg) > 1900:
         msg = "\n".join(lines[:30] + ["… (trimmed)"])
     await interaction.response.send_message(msg)
 
-@bot.tree.command(name="sanchodelete", description="Delete a Sancho link by ID, or your latest one with last:true")
+@bot.tree.command(name="sanchodelete", description="Delete a Sancho link by ID, your latest, or by number from your last numbered list")
 @app_commands.describe(
-    id="The entry ID (use /sancholinks show_ids:true to find it). If omitted and last:true, deletes your latest.",
-    last="If true and no ID is provided, deletes your most recent link"
+    id="Entry ID (use /sancholinks show_ids:true)",
+    last="If true and no ID/num is provided, deletes your most recent link",
+    num="Index from your last /sancholinks numbered:true output (1 = first shown)"
 )
-async def sanchodelete(interaction: discord.Interaction, id: int | None = None, last: bool = False):
+async def sanchodelete(interaction: discord.Interaction, id: int | None = None, last: bool = False, num: int | None = None):
     # Only writers or admin may delete
     if interaction.user.id not in SANCHO_ALLOWED and interaction.user.id != ADMIN_USER_ID:
         return await interaction.response.send_message("Only approved users can delete Sancho links.", ephemeral=True)
 
-    if id is None:
-        if not last:
+    # Resolve target row ID
+    target_id: int | None = None
+
+    if id is not None:
+        target_id = id
+    elif num is not None:
+        lst = SANCHO_INDEX_CACHE.get((interaction.guild_id, interaction.user.id))
+        if not lst:
             return await interaction.response.send_message(
-                "Provide an `id:` or set `last:true` to delete your most recent entry.",
+                "No numbered list cached. Run `/sancholinks numbered:true` first, then try again.",
                 ephemeral=True
             )
-        rid = await sancho_latest_id_for_author(interaction.guild_id, interaction.user.id)
-        if not rid:
+        if num < 1 or num > len(lst):
+            return await interaction.response.send_message(
+                f"`num` must be between 1 and {len(lst)} from your last numbered list.",
+                ephemeral=True
+            )
+        target_id = lst[num - 1]
+    elif last:
+        target_id = await sancho_latest_id_for_author(interaction.guild_id, interaction.user.id)
+        if not target_id:
             return await interaction.response.send_message("You have no Sancho links to delete.", ephemeral=True)
     else:
-        rid = id
-
-    ok = await sancho_delete_by_id(interaction.guild_id, rid, interaction.user.id)
-    if not ok:
         return await interaction.response.send_message(
-            "Couldn’t delete that entry. Are you the author (or admin), and is the ID correct?",
+            "Provide an `id:`, or `num:`, or set `last:true`.",
             ephemeral=True
         )
-    await interaction.response.send_message(f"🗑️ Deleted Sancho entry `#{rid}`.", ephemeral=False)
+
+    ok = await sancho_delete_by_id(interaction.guild_id, target_id, interaction.user.id)
+    if not ok:
+        return await interaction.response.send_message(
+            "Couldn’t delete that entry. Are you the author (or admin), and is the ID/number correct?",
+            ephemeral=True
+        )
+    await interaction.response.send_message(f"🗑️ Deleted Sancho entry `#{target_id}`.", ephemeral=False)
 
 # ========= BONK + SPOTIFY LIVE + REMINDER CAPTURE =========
 @bot.event
@@ -1031,12 +1028,7 @@ async def on_message(message: discord.Message):
                 pass
 
             try:
-                await log_bonk(
-                    guild_id=message.guild.id,
-                    bonker_id=message.author.id,
-                    channel_id=message.channel.id,
-                    message_id=message.id
-                )
+                await log_bonk(message.guild.id, message.author.id, message.channel.id, message.id)
                 count_today = await today_bonk_count(message.guild.id)
 
                 if count_today % BONK_STREAK_STEP == 0:
@@ -1052,13 +1044,7 @@ async def on_message(message: discord.Message):
                 if count_today % BONK_PENALTY_STEP == 0:
                     await adjust_points(message.guild.id, TARGET_USER_ID, -BONK_PENALTY_AMOUNT)
                     actor_id = bot.user.id if bot.user else ADMIN_USER_ID
-                    await log_txn(
-                        guild_id=message.guild.id,
-                        actor_id=actor_id,
-                        target_id=TARGET_USER_ID,
-                        delta=-BONK_PENALTY_AMOUNT,
-                        reason=f"{BONK_PENALTY_STEP}-bonk penalty"
-                    )
+                    await log_txn(message.guild.id, actor_id, TARGET_USER_ID, -BONK_PENALTY_AMOUNT, f"{BONK_PENALTY_STEP}-bonk penalty")
                     total = await get_points(message.guild.id, TARGET_USER_ID)
                     await message.channel.send(
                         f"💀 {target_mention} has been bonked **{count_today}** times today and loses "
@@ -1069,13 +1055,7 @@ async def on_message(message: discord.Message):
                 if count_today % BONK_BIG_PENALTY_STEP == 0:
                     await adjust_points(message.guild.id, TARGET_USER_ID, -BONK_BIG_PENALTY_AMOUNT)
                     actor_id = bot.user.id if bot.user else ADMIN_USER_ID
-                    await log_txn(
-                        guild_id=message.guild.id,
-                        actor_id=actor_id,
-                        target_id=TARGET_USER_ID,
-                        delta=-BONK_BIG_PENALTY_AMOUNT,
-                        reason=f"{BONK_BIG_PENALTY_STEP}-bonk penalty"
-                    )
+                    await log_txn(message.guild.id, actor_id, TARGET_USER_ID, -BONK_BIG_PENALTY_AMOUNT, f"{BONK_BIG_PENALTY_STEP}-bonk penalty")
                     total = await get_points(message.guild.id, TARGET_USER_ID)
                     await message.channel.send(
                         f"☠️ {target_mention} hit **{count_today}** bonks today and loses an extra "
