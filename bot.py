@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS smuckles_nuke_state (
 );
 """
 
-# 🆕 Name-change history
+# Name-change history
 CREATE_NAME_HISTORY = """
 CREATE TABLE IF NOT EXISTS smuckles_name_history (
   id         BIGSERIAL PRIMARY KEY,
@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS smuckles_name_history (
 );
 """
 
-# 🆕 Sancho link bank
+# Sancho link bank
 CREATE_SANCHO = """
 CREATE TABLE IF NOT EXISTS smuckles_sancho_links (
   id         BIGSERIAL PRIMARY KEY,
@@ -365,21 +365,46 @@ async def sancho_add(guild_id: int, author_id: int, url: str, note: str | None):
             guild_id, author_id, url, note
         )
 
-async def sancho_list(guild_id: int, limit: int = 10, author_id: int | None = None):
+async def sancho_list(guild_id: int, limit: int = 10, author_id: int | None = None, with_ids: bool = False):
     async with db_pool.acquire() as con:
         if author_id:
             rows = await con.fetch(
-                "SELECT author_id, url, note, created_at FROM smuckles_sancho_links "
-                "WHERE guild_id=$1 AND author_id=$2 ORDER BY created_at DESC LIMIT $3",
+                f"SELECT {'id,' if with_ids else ''} author_id, url, note, created_at "
+                f"FROM smuckles_sancho_links "
+                f"WHERE guild_id=$1 AND author_id=$2 ORDER BY created_at DESC LIMIT $3",
                 guild_id, author_id, limit
             )
         else:
             rows = await con.fetch(
-                "SELECT author_id, url, note, created_at FROM smuckles_sancho_links "
-                "WHERE guild_id=$1 ORDER BY created_at DESC LIMIT $2",
+                f"SELECT {'id,' if with_ids else ''} author_id, url, note, created_at "
+                f"FROM smuckles_sancho_links "
+                f"WHERE guild_id=$1 ORDER BY created_at DESC LIMIT $2",
                 guild_id, limit
             )
     return rows
+
+async def sancho_latest_id_for_author(guild_id: int, author_id: int) -> int | None:
+    async with db_pool.acquire() as con:
+        rid = await con.fetchval(
+            "SELECT id FROM smuckles_sancho_links WHERE guild_id=$1 AND author_id=$2 "
+            "ORDER BY created_at DESC LIMIT 1",
+            guild_id, author_id
+        )
+    return int(rid) if rid else None
+
+async def sancho_delete_by_id(guild_id: int, row_id: int, requestor_id: int) -> bool:
+    async with db_pool.acquire() as con:
+        rec = await con.fetchrow(
+            "SELECT author_id FROM smuckles_sancho_links WHERE id=$1 AND guild_id=$2",
+            row_id, guild_id
+        )
+        if not rec:
+            return False
+        author_id = int(rec["author_id"])
+        if requestor_id != author_id and requestor_id != ADMIN_USER_ID:
+            return False
+        await con.execute("DELETE FROM smuckles_sancho_links WHERE id=$1 AND guild_id=$2", row_id, guild_id)
+    return True
 
 # ========= HELPERS =========
 def is_admin(user_id: int) -> bool:
@@ -610,7 +635,8 @@ async def papohelp(interaction: discord.Interaction):
 
         "### 🔗 Sancho Link Bank\n"
         "• `/sancho url:<link> [note:<text>]` — (allowed users only) save a link.\n"
-        "• `/sancholinks [limit] [mine] [author]` — list saved links.\n\n"
+        "• `/sancholinks [limit] [mine] [author] [show_ids]` — list saved links.\n"
+        "• `/sanchodelete [id] [last]` — delete by ID, or your latest if `last:true`.\n\n"
 
         "### 🧪 Utility\n"
         "• `/papoping` — latency test.\n"
@@ -909,31 +935,11 @@ async def bonktop(interaction: discord.Interaction, limit: int = 10, window: str
         lines.append(f"{i}. <@{uid}> — **{c}**")
     await interaction.response.send_message("\n".join(lines))
 
-# ========= Admin: remove bonks =========
-@bot.tree.command(name="bonkremove", description="Admin: remove recent bonks a member made against the target")
-@app_commands.describe(member="Member whose bonks to remove", count="How many recent bonks to remove", window="all | day | week")
-async def bonkremove(interaction: discord.Interaction, member: discord.Member, count: int, window: str = "all"):
-    if interaction.user.id != ADMIN_USER_ID:
-        return await interaction.response.send_message("Only the bot admin can remove bonks.", ephemeral=True)
-    window = window.lower().strip()
-    if window not in ("all", "day", "week"):
-        return await interaction.response.send_message("`window` must be one of: **all**, **day**, **week**.", ephemeral=True)
-    if count <= 0 or count > 1000:
-        return await interaction.response.send_message("`count` must be between 1 and 1000.", ephemeral=True)
-
-    removed = await remove_bonks_for_user(interaction.guild_id, member.id, window, count)
-    if removed == 0:
-        return await interaction.response.send_message(f"No matching bonks found to remove for {member.mention} in `{window}` window.", ephemeral=True)
-    await interaction.response.send_message(
-        f"🧽 Removed **{removed}** bonk{'s' if removed != 1 else ''} made by {member.mention} against <@{TARGET_USER_ID}> in `{window}` window.",
-        ephemeral=True
-    )
-
 # ========= SANCHO COMMANDS =========
 @bot.tree.command(name="sancho", description="Save a link to the Sancho bank (allowed users only).")
 @app_commands.describe(url="The link (must start with http:// or https://)", note="Optional note or label")
 async def sancho(interaction: discord.Interaction, url: str, note: str | None = None):
-    if interaction.user.id not in SANCHO_ALLOWED:
+    if interaction.user.id not in SANCHO_ALLOWED and interaction.user.id != ADMIN_USER_ID:
         return await interaction.response.send_message("Only approved users can add to Sancho.", ephemeral=True)
     if not URL_REGEX.match(url):
         return await interaction.response.send_message("Please provide a valid URL starting with http:// or https://", ephemeral=True)
@@ -945,17 +951,13 @@ async def sancho(interaction: discord.Interaction, url: str, note: str | None = 
 @app_commands.describe(
     limit="How many to show (default 10, max 50)",
     mine="Show only links you added (default false)",
-    author="Filter to a specific author (overrides mine if set)"
+    author="Filter to a specific author (overrides mine if set)",
+    show_ids="Show internal IDs so you can delete or edit specific entries"
 )
-async def sancholinks(interaction: discord.Interaction, limit: int = 10, mine: bool = False, author: discord.Member | None = None):
+async def sancholinks(interaction: discord.Interaction, limit: int = 10, mine: bool = False, author: discord.Member | None = None, show_ids: bool = False):
     limit = max(1, min(50, limit))
-    author_id = None
-    if author:
-        author_id = author.id
-    elif mine:
-        author_id = interaction.user.id
-
-    rows = await sancho_list(interaction.guild_id, limit=limit, author_id=author_id)
+    author_id = author.id if author else (interaction.user.id if mine else None)
+    rows = await sancho_list(interaction.guild_id, limit=limit, author_id=author_id, with_ids=show_ids)
     if not rows:
         return await interaction.response.send_message("No Sancho links found for that filter.", ephemeral=False)
 
@@ -966,17 +968,49 @@ async def sancholinks(interaction: discord.Interaction, limit: int = 10, mine: b
 
     lines = [header]
     for r in rows:
-        who = int(r["author_id"])
-        url = r["url"]
+        rid  = int(r["id"]) if show_ids else None
+        who  = int(r["author_id"])
+        url  = r["url"]
         note = r["note"]
         when = r["created_at"].strftime("%Y-%m-%d %H:%M")
+        id_prefix = f"`#{rid}` • " if show_ids else ""
         tail = f" — _{note}_" if note else ""
-        lines.append(f"• {url}{tail}  _(by <@{who}> • {when})_")
+        lines.append(f"• {id_prefix}{url}{tail}  _(by <@{who}> • {when})_")
 
     msg = "\n".join(lines)
     if len(msg) > 1900:
         msg = "\n".join(lines[:30] + ["… (trimmed)"])
     await interaction.response.send_message(msg)
+
+@bot.tree.command(name="sanchodelete", description="Delete a Sancho link by ID, or your latest one with last:true")
+@app_commands.describe(
+    id="The entry ID (use /sancholinks show_ids:true to find it). If omitted and last:true, deletes your latest.",
+    last="If true and no ID is provided, deletes your most recent link"
+)
+async def sanchodelete(interaction: discord.Interaction, id: int | None = None, last: bool = False):
+    # Only writers or admin may delete
+    if interaction.user.id not in SANCHO_ALLOWED and interaction.user.id != ADMIN_USER_ID:
+        return await interaction.response.send_message("Only approved users can delete Sancho links.", ephemeral=True)
+
+    if id is None:
+        if not last:
+            return await interaction.response.send_message(
+                "Provide an `id:` or set `last:true` to delete your most recent entry.",
+                ephemeral=True
+            )
+        rid = await sancho_latest_id_for_author(interaction.guild_id, interaction.user.id)
+        if not rid:
+            return await interaction.response.send_message("You have no Sancho links to delete.", ephemeral=True)
+    else:
+        rid = id
+
+    ok = await sancho_delete_by_id(interaction.guild_id, rid, interaction.user.id)
+    if not ok:
+        return await interaction.response.send_message(
+            "Couldn’t delete that entry. Are you the author (or admin), and is the ID correct?",
+            ephemeral=True
+        )
+    await interaction.response.send_message(f"🗑️ Deleted Sancho entry `#{rid}`.", ephemeral=False)
 
 # ========= BONK + SPOTIFY LIVE + REMINDER CAPTURE =========
 @bot.event
@@ -987,7 +1021,7 @@ async def on_message(message: discord.Message):
     content = message.content or ""
     low = content.lower()
 
-    # --- BONK for everyone (server channels only) ---
+    # --- BONK for everyone ---
     if message.guild and "bonk" in low:
         if not bonk_on_cooldown(message.author.id):
             target_mention = f"<@{TARGET_USER_ID}>"
@@ -1094,5 +1128,5 @@ async def on_message(message: discord.Message):
 
 # ========= RUN =========
 if not TOKEN:
-    raise SystemExit("❌ Missing DISCORD_TOKEN environment variable.")
+    raise SystemExit("❌ Missing DISCORD_TOKEN env var.")
 bot.run(TOKEN)
