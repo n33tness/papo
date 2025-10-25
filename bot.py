@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # postgres://user:pass@host:port/db
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # set in Railway for instant per-guild sync
-ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))  # optional; where to post nuke/announce messages
+ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))  # optional; where to post announce messages
 
 # 🍜 Currency / theme
 CURRENCY_EMOJI = "🍉"
@@ -23,6 +23,9 @@ CURRENCY_NAME  = "golden noodles"
 TARGET_USER_ID = 1028310674318839878         # user whose noodles/bonks/spotify/names we track
 AUTHORIZED_GIVER_ID = 1422010902680567918    # can /give, /take
 ADMIN_USER_ID = 939225086341296209           # full admin override
+
+# Sancho link-bank writers (both can add links)
+SANCHO_ALLOWED = {661077262468382761, 939225086341296209}
 
 # Golden noodles settings
 MULTIPLE_OF = 5
@@ -46,6 +49,9 @@ SPOTIFY_REGEX = re.compile(
     re.IGNORECASE
 )
 
+# URL validation (basic)
+URL_REGEX = re.compile(r'^https?://[^\s]+$', re.IGNORECASE)
+
 # Nuke counter (Oct 31, 12:45pm America/Chicago)
 NUKE_TZ = ZoneInfo("America/Chicago")
 NUKE_MONTH = 10
@@ -57,7 +63,7 @@ NUKE_THRESHOLD = 100  # must be >= to be safe
 # ========= DISCORD CLIENT =========
 intents = discord.Intents.default()
 intents.message_content = True  # capture bonk/spotify/remind
-intents.members = True          # REQUIRED for nickname change tracking (and member cache)
+intents.members = True          # REQUIRED for nickname change tracking
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db_pool: asyncpg.Pool | None = None
@@ -144,6 +150,18 @@ CREATE TABLE IF NOT EXISTS smuckles_name_history (
 );
 """
 
+# 🆕 Sancho link bank
+CREATE_SANCHO = """
+CREATE TABLE IF NOT EXISTS smuckles_sancho_links (
+  id         BIGSERIAL PRIMARY KEY,
+  guild_id   BIGINT NOT NULL,
+  author_id  BIGINT NOT NULL,
+  url        TEXT NOT NULL,
+  note       TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
 async def db_init():
     global db_pool
     if not DATABASE_URL:
@@ -157,6 +175,7 @@ async def db_init():
         await con.execute(CREATE_BONK_LOG)
         await con.execute(CREATE_NUKE_STATE)
         await con.execute(CREATE_NAME_HISTORY)
+        await con.execute(CREATE_SANCHO)
 
 # ======== Golden Noodles ========
 async def adjust_points(guild_id: int, target_id: int, delta: int):
@@ -338,6 +357,30 @@ async def fetch_name_history(guild_id: int, user_id: int, limit: int = 25):
         )
     return rows
 
+# ======== Sancho (link bank) ========
+async def sancho_add(guild_id: int, author_id: int, url: str, note: str | None):
+    async with db_pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO smuckles_sancho_links (guild_id, author_id, url, note) VALUES ($1,$2,$3,$4)",
+            guild_id, author_id, url, note
+        )
+
+async def sancho_list(guild_id: int, limit: int = 10, author_id: int | None = None):
+    async with db_pool.acquire() as con:
+        if author_id:
+            rows = await con.fetch(
+                "SELECT author_id, url, note, created_at FROM smuckles_sancho_links "
+                "WHERE guild_id=$1 AND author_id=$2 ORDER BY created_at DESC LIMIT $3",
+                guild_id, author_id, limit
+            )
+        else:
+            rows = await con.fetch(
+                "SELECT author_id, url, note, created_at FROM smuckles_sancho_links "
+                "WHERE guild_id=$1 ORDER BY created_at DESC LIMIT $2",
+                guild_id, limit
+            )
+    return rows
+
 # ========= HELPERS =========
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_USER_ID
@@ -494,10 +537,8 @@ async def nuke_watch():
 # ========= NAME CHANGE TRACKING =========
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    # Track server NICKNAME changes for the target user
     if after.id != TARGET_USER_ID:
         return
-    # before.nick can be None, same for after.nick
     if before.nick != after.nick:
         old = before.nick or before.name
         new = after.nick or after.name
@@ -508,11 +549,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @bot.event
 async def on_user_update(before: discord.User, after: discord.User):
-    # Track GLOBAL USERNAME changes for the target user
     if after.id != TARGET_USER_ID:
         return
     if before.name != after.name:
-        # Save for all guilds the bot shares with the user (so history appears in that server too)
         for guild in bot.guilds:
             member = guild.get_member(after.id)
             if member:
@@ -521,7 +560,7 @@ async def on_user_update(before: discord.User, after: discord.User):
                 except Exception as e:
                     print("Name history (username) save error:", e)
 
-# ========= /paponing =========
+# ========= /papoping =========
 @bot.tree.command(name="papoping", description="Check if the bot is alive and running")
 async def papoping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
@@ -547,10 +586,10 @@ async def papohelp(interaction: discord.Interaction):
 
         "### 🔨 Bonks\n"
         f"• Type `bonk` in chat to bonk {target} (3s personal cooldown).\n"
-        "• Streak memes at 10, 20, 30… bonks per day (+ penalties at 20 & 100).\n"
+        "• Streak memes at 10, 20, 30… (+ penalties at 20 & 100).\n"
         "• `/bonkstats [member]` — bonks today/week/all-time.\n"
         "• `/bonktop [limit] [window]` — bonk leaderboard (window: all/day/week).\n"
-        "• `/bonkremove member:<user> count:<n> window:<all|day|week>` — (admin) remove recent bonks from a user.\n\n"
+        "• `/bonkremove member:<user> count:<n> window:<all|day|week>` — (admin) remove recent bonks.\n\n"
 
         "### 🧨 Nuke Counter\n"
         "• Auto-check at **Oct 31, 12:45 PM (America/Chicago)**. If target < 100 noodles, balance resets to 0.\n"
@@ -563,14 +602,15 @@ async def papohelp(interaction: discord.Interaction):
 
         "### 🗒️ Reminder Bank\n"
         "• Mention the bot + say **remind ...** to save a reminder.\n"
-        "• `/myreminders [limit]` — your reminders.\n"
-        "• `/clearmyreminders` — delete your reminders.\n"
-        "• `/remindbank [limit]` — (admin) view recent reminders.\n"
-        "• `/clearemindbank` — (admin) wipe all reminders.\n\n"
+        "• `/myreminders [limit]`, `/clearmyreminders`, `/remindbank`, `/clearemindbank`.\n\n"
 
         "### 🏷️ Name History\n"
-        "• Tracks target’s **nickname** (server) & **username** (global) changes.\n"
+        "• Tracks target’s **nickname** & **username** changes.\n"
         "• `/paponames [limit]` — show recent name changes.\n\n"
+
+        "### 🔗 Sancho Link Bank\n"
+        "• `/sancho url:<link> [note:<text>]` — (allowed users only) save a link.\n"
+        "• `/sancholinks [limit] [mine] [author]` — list saved links.\n\n"
 
         "### 🧪 Utility\n"
         "• `/papoping` — latency test.\n"
@@ -615,7 +655,6 @@ async def paponames(interaction: discord.Interaction, limit: int = 25):
         oldn = r["old_name"]
         newn = r["new_name"]
         ts   = r["changed_at"]
-        # nicely format timestamp in server’s local notion; here we print ISO short
         when = ts.strftime("%Y-%m-%d %H:%M")
         label = "Nickname" if kind == "nick" else "Username"
         lines.append(f"• **{label}** — `{oldn}` → `{newn}` _({when})_")
@@ -730,7 +769,7 @@ async def papolinks(interaction: discord.Interaction, limit: int = 10):
         msg = "\n".join(lines)
     await interaction.response.send_message(msg)
 
-# ========= /paposcan (admin) =========
+# ========= /paposcan (admin-only backfill of Spotify links) =========
 @bot.tree.command(name="paposcan", description="Admin: scan a channel's history to backfill the target's Spotify links")
 @app_commands.describe(
     channel="Text channel to scan",
@@ -785,7 +824,7 @@ async def paposcan(interaction: discord.Interaction, channel: discord.TextChanne
         ephemeral=True
     )
 
-# ========= Reminder bank =========
+# ========= Reminder bank commands =========
 @bot.tree.command(name="remindbank", description="Admin: list recent stored reminder requests")
 @app_commands.describe(limit="How many to show (default 10, max 50)")
 async def remindbank(interaction: discord.Interaction, limit: int = 10):
@@ -889,6 +928,55 @@ async def bonkremove(interaction: discord.Interaction, member: discord.Member, c
         f"🧽 Removed **{removed}** bonk{'s' if removed != 1 else ''} made by {member.mention} against <@{TARGET_USER_ID}> in `{window}` window.",
         ephemeral=True
     )
+
+# ========= SANCHO COMMANDS =========
+@bot.tree.command(name="sancho", description="Save a link to the Sancho bank (allowed users only).")
+@app_commands.describe(url="The link (must start with http:// or https://)", note="Optional note or label")
+async def sancho(interaction: discord.Interaction, url: str, note: str | None = None):
+    if interaction.user.id not in SANCHO_ALLOWED:
+        return await interaction.response.send_message("Only approved users can add to Sancho.", ephemeral=True)
+    if not URL_REGEX.match(url):
+        return await interaction.response.send_message("Please provide a valid URL starting with http:// or https://", ephemeral=True)
+    await sancho_add(interaction.guild_id, interaction.user.id, url.strip(), (note or "").strip() or None)
+    pretty_note = f" — _{note.strip()}_" if note and note.strip() else ""
+    await interaction.response.send_message(f"✅ Saved to Sancho: {url}{pretty_note}")
+
+@bot.tree.command(name="sancholinks", description="Show saved Sancho links (optionally filter to yours or a specific author)")
+@app_commands.describe(
+    limit="How many to show (default 10, max 50)",
+    mine="Show only links you added (default false)",
+    author="Filter to a specific author (overrides mine if set)"
+)
+async def sancholinks(interaction: discord.Interaction, limit: int = 10, mine: bool = False, author: discord.Member | None = None):
+    limit = max(1, min(50, limit))
+    author_id = None
+    if author:
+        author_id = author.id
+    elif mine:
+        author_id = interaction.user.id
+
+    rows = await sancho_list(interaction.guild_id, limit=limit, author_id=author_id)
+    if not rows:
+        return await interaction.response.send_message("No Sancho links found for that filter.", ephemeral=False)
+
+    header = "🔗 **Sancho Links**"
+    if author_id:
+        header += f" — by <@{author_id}>"
+    header += f" (showing {len(rows)})"
+
+    lines = [header]
+    for r in rows:
+        who = int(r["author_id"])
+        url = r["url"]
+        note = r["note"]
+        when = r["created_at"].strftime("%Y-%m-%d %H:%M")
+        tail = f" — _{note}_" if note else ""
+        lines.append(f"• {url}{tail}  _(by <@{who}> • {when})_")
+
+    msg = "\n".join(lines)
+    if len(msg) > 1900:
+        msg = "\n".join(lines[:30] + ["… (trimmed)"])
+    await interaction.response.send_message(msg)
 
 # ========= BONK + SPOTIFY LIVE + REMINDER CAPTURE =========
 @bot.event
@@ -1006,5 +1094,5 @@ async def on_message(message: discord.Message):
 
 # ========= RUN =========
 if not TOKEN:
-    raise SystemExit("❌ Missing DISCORD_TOKEN env var.")
+    raise SystemExit("❌ Missing DISCORD_TOKEN environment variable.")
 bot.run(TOKEN)
