@@ -168,9 +168,13 @@ CREATE TABLE IF NOT EXISTS smuckles_sancho_links (
 """
 
 async def db_init():
+    """
+    Initialize asyncpg pool and ensure all tables exist.
+    This will raise if DATABASE_URL is missing or invalid.
+    """
     global db_pool
     if not DATABASE_URL:
-        raise SystemExit("❌ Missing DATABASE_URL environment variable.")
+        raise RuntimeError("Missing DATABASE_URL environment variable.")
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
     async with db_pool.acquire() as con:
         await con.execute(CREATE_USERS)
@@ -321,7 +325,7 @@ async def remove_bonks_for_user(guild_id: int, bonker_id: int, window: str, coun
     if window == "day":
         where += " AND created_at::date = CURRENT_DATE"
     elif window == "week":
-        where += " AND created_at >= (NOW() - INTERVAL '7 days')"
+        where += " AND created_at >= (NOW - INTERVAL '7 days')"
     sql = f"""
     WITH to_del AS (
         SELECT id FROM smuckles_bonk_log
@@ -511,7 +515,19 @@ async def announce(guild: discord.Guild, msg: str):
 # ========= READY & TASKS =========
 @bot.event
 async def on_ready():
-    await db_init()
+    """
+    Called when the bot is ready. Tries to init DB and logs failures clearly.
+    """
+    # NEW: robust DB init with logging
+    try:
+        await db_init()
+        print("✅ DB INIT OK")
+    except Exception as e:
+        print("❌ DB INIT FAILED:", repr(e))
+        # If you prefer to hard-fail when DB is broken, uncomment:
+        # import sys
+        # sys.exit(1)
+
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
@@ -563,6 +579,28 @@ async def nuke_watch():
                 await mark_executed(guild.id, deadline_date)
         except Exception as e:
             print(f"Nuke watcher error in guild {guild.id}: {e}")
+
+# ========= GLOBAL SLASH-COMMAND ERROR HANDLER (NEW) =========
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """
+    Catches exceptions from all slash commands so users don't just see
+    'The application did not respond'. Also logs the real error.
+    """
+    print("Slash command error:", repr(error))
+
+    # Some errors wrap the real one in .original
+    real_error = getattr(error, "original", error)
+    print("Real error:", repr(real_error))
+
+    msg = "Something went wrong running that command."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 # ========= NAME CHANGE TRACKING =========
 @bot.event
@@ -1100,6 +1138,9 @@ async def on_message(message: discord.Message):
                     mentions_text=mentions_text,
                     note=note[:500]
                 )
+            except Exception:
+                pass
+            try:
                 await message.channel.send(f"✅ Saved reminder to bank: _{note[:120]}{'…' if len(note)>120 else ''}_")
             except Exception:
                 pass
